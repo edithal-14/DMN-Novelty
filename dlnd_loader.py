@@ -6,7 +6,7 @@ import logging
 import pickle
 import random
 import numpy as np
-from sklearn.model_selection import train_test_split
+from sklearn.model_selection import train_test_split, StratifiedKFold
 from torch.utils.data.dataset import Dataset
 from torch.utils.data.dataloader import default_collate
 
@@ -50,7 +50,8 @@ def get_dlnd_data():
     """
     # Add encoding='latin1' to unpickle a file in python3 which was picklized in python2
     # data = [src_docs, tgt_docs, src_ids, tgt_ids, vocab, golds]
-    src_docs, tgt_docs, src_ids, tgt_ids, vocab, golds = pickle.load(open(DLND_DATA, 'rb'), encoding='latin1')
+    src_docs, tgt_docs, src_ids, tgt_ids, vocab, golds \
+            = pickle.load(open(DLND_DATA, 'rb'), encoding='latin1')
     # random oversampling of minority class (novel class: 1)
     data = [src_docs, tgt_docs, src_ids, tgt_ids, golds]
     return oversample_novel(data), vocab
@@ -65,13 +66,11 @@ def split_data(data):
     train_data, valid_data = split_stratify_data(train_data)
     # Print split sizes
     train_size = len(train_data[0])
-    LOG.debug(f'Train data size: {train_size}')
+    LOG.debug('Train data size: %d', train_size)
     valid_size = len(valid_data[0])
-    LOG.debug(f'Valid data size: {valid_size}')
+    LOG.debug('Valid data size: %d', valid_size)
     test_size = len(test_data[0])
-    LOG.debug(f'Test data size: {test_size}')
-    data_size = len(data[0])
-    LOG.debug(f'Total data size: {data_size}')
+    LOG.debug('Test data size: %d', test_size)
     return train_data, valid_data, test_data
 
 def pad_collate(batch, vocab):
@@ -88,7 +87,7 @@ def pad_collate(batch, vocab):
     max_src_size = 0
     max_tgt_size = 0
     for i, elem in enumerate(batch):
-        _, _, src_ids , tgt_ids, _ = elem
+        _, _, src_ids, tgt_ids, _ = elem
         src_size = len(src_ids)
         tgt_size = len(tgt_ids)
         if src_size > max_src_size:
@@ -122,17 +121,35 @@ def pad_collate(batch, vocab):
 
 class DLND(Dataset):
     """
-    Pytorch Dataset class for DLND data
+    Pytorch Dataset class for DLND data:
+
+    Supports k fold cross validation when folds > 1
     """
-    def __init__(self, mode='train'):
+    def __init__(self, mode='train', folds=1):
         self.mode = mode
         # self.data = docs, src_ids, tgt_ids, golds
         self.data, self.vocab = get_dlnd_data()
         # Set self.hidden = embedding size = self.vocab.shape[1]
         self.hidden = self.vocab.shape[1]
-        LOG.debug(f'Sentence Embedding dimension: {self.hidden}')
-        # Set self.{train|valid|test}
-        self.train, self.valid, self.test = split_data(self.data)
+        LOG.debug('Sentence Embedding dimension: %d', self.hidden)
+        LOG.debug('Total data size: %d', len(self.data[0]))
+        if folds <= 1:
+            # Set splitting type
+            self.split_type = 'ninety-ten'
+            # Set self.{train|valid|test}
+            self.train, self.valid, self.test = split_data(self.data)
+        else:
+            # Set splitting type
+            self.split_type = 'kfold'
+            # Set self.folds
+            self.curr_fold = -1
+            # golds = data[-1]
+            skf = StratifiedKFold(
+                n_splits=folds,
+                random_state=RANDOM_SEED,
+                shuffle=True)
+            self.folds = skf.split(np.zeros(len(self.data[0])), self.data[-1])
+            LOG.debug('Number of folds created: %d', folds)
 
     def set_mode(self, mode):
         """
@@ -140,6 +157,26 @@ class DLND(Dataset):
         mode = {train|valid|split}
         """
         self.mode = mode
+
+    def next_fold(self):
+        """
+        Sets self.{train|valid|test} from the next fold
+        """
+        if not self.split_type == 'kfold':
+            LOG.error('KFold splitting is not enabled')
+            return
+        self.curr_fold += 1
+        try:
+            train_idx, test_idx = next(self.folds)
+        except StopIteration:
+            LOG.error('No more folds to process')
+            return
+        train_size = int(len(train_idx) * 0.9)
+        valid_idx = train_idx[train_size:]
+        train_idx = train_idx[:train_size]
+        self.train = [[item[idx] for idx in train_idx] for item in self.data]
+        self.valid = [[item[idx] for idx in valid_idx] for item in self.data]
+        self.test = [[item[idx] for idx in test_idx] for item in self.data]
 
     def __len__(self):
         if self.mode == 'train':

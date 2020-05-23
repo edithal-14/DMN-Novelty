@@ -5,7 +5,7 @@ Train DLND model
 import logging
 import os
 import torch
-torch.cuda.set_device(2)
+torch.cuda.set_device(0)
 import torch.nn as nn
 import torch.nn.functional as F
 import torch.nn.init as init
@@ -243,67 +243,73 @@ def step(dataloader, model, optim, train=True):
 
 if __name__ == "__main__":
     # Config variables
+    NUM_FOLDS = 10
+    NUM_HOPS = 4
     NUM_EPOCHS = 25
     BATCH_SIZE = 32
     EARLY_STOP_THRESHOLD = 10
     PRE_TRAINED_MODEL = None
     EPOCH_OFFSET = 1
-
     # Initialise DLND data
-    dset = DLND()
+    dset = DLND(folds=NUM_FOLDS)
     collate_func = partial(pad_collate, vocab=dset.vocab)
-
     # Model parameters
     # hidden_size = sentence embedding dimension
     hidden_size = dset.hidden
+    # collect acuracy across all the folds
+    all_folds_acc = 0
+    for fold_num in range(NUM_FOLDS):
+        # define the model
+        model = DMNPlus(hidden_size, num_hop=NUM_HOPS)
+        model.cuda()
+        if PRE_TRAINED_MODEL:
+            with open(PRE_TRAINED_MODEL, 'rb') as fp:
+                model.load_state_dict(torch.load(fp))
+        early_stopping_cnt = 0
+        early_stopping_flag = False
+        best_acc = 0
+        optim = torch.optim.Adam(model.parameters())
+        # Get the current fold of data to use
+        dset.next_fold()
+        LOG.debug('Fold no: %d', fold_num + 1)
+        # Training starts here
+        for epoch in range(EPOCH_OFFSET, NUM_EPOCHS+EPOCH_OFFSET):
+            # Training step
+            dset.set_mode('train')
+            train_loader = DataLoader(dset, batch_size=BATCH_SIZE, shuffle=True, collate_fn=collate_func)
+            model.train()
+            LOG.debug(f'Epoch {epoch}')
+            acc = step(train_loader, model, optim, train=True)
 
-    model = DMNPlus(hidden_size, num_hop=6)
-    model.cuda()
-    if PRE_TRAINED_MODEL:
-        with open(PRE_TRAINED_MODEL, 'rb') as fp:
-            model.load_state_dict(torch.load(fp))
-    early_stopping_cnt = 0
-    early_stopping_flag = False
-    best_acc = 0
-    optim = torch.optim.Adam(model.parameters())
-
-    # Training starts here
-    for epoch in range(EPOCH_OFFSET, NUM_EPOCHS+EPOCH_OFFSET):
-        # Training step
-        dset.set_mode('train')
-        train_loader = DataLoader(dset, batch_size=BATCH_SIZE, shuffle=True, collate_fn=collate_func)
-        model.train()
-        LOG.debug(f'Epoch {epoch}')
-        acc = step(train_loader, model, optim, train=True)
-
-        # Validation step
-        dset.set_mode('valid')
-        valid_loader = DataLoader(dset, batch_size=BATCH_SIZE, shuffle=False, collate_fn=collate_func)
-        model.eval()
-        acc = step(valid_loader, model, optim, train=False)
-        LOG.debug(f'Epoch {epoch}: [Validate] Accuracy : {acc: {5}.{4}}')
-        if acc > best_acc:
-            best_acc = acc
-            best_state = model.state_dict()
-            early_stopping_cnt = 0
-        else:
-            early_stopping_cnt += 1
-            if early_stopping_cnt >= EARLY_STOP_THRESHOLD:
-                early_stopping_flag = True
-        if early_stopping_flag:
-            LOG.debug(f'Early Stopping at Epoch {epoch}, no improvement in {EARLY_STOP_THRESHOLD} epochs') 
-            break
-
-    # Testing starts here
-    dset.set_mode('test')
-    # update epoch to the best performing epoch
-    epoch -= early_stopping_cnt
-    # load the state from the best performing epoch
-    model.load_state_dict(best_state)
-    test_loader = DataLoader(dset, batch_size=BATCH_SIZE, shuffle=False, collate_fn=collate_func)
-    test_acc = step(test_loader, model, optim, train=False)
-    LOG.debug(f'Epoch {epoch}: [Test] Accuracy : {test_acc : {5}.{4}}')
-    # Save the best model
-    os.makedirs('models', exist_ok=True)
-    with open(f'models/6hops_epoch{epoch}_acc{best_acc}.pth', 'wb') as fp:
-        torch.save(best_state, fp)
+            # Validation step
+            dset.set_mode('valid')
+            valid_loader = DataLoader(dset, batch_size=BATCH_SIZE, shuffle=False, collate_fn=collate_func)
+            model.eval()
+            acc = step(valid_loader, model, optim, train=False)
+            LOG.debug(f'Epoch {epoch}: [Validate] Accuracy : {acc: {5}.{4}}')
+            if acc > best_acc:
+                best_acc = acc
+                best_state = model.state_dict()
+                early_stopping_cnt = 0
+            else:
+                early_stopping_cnt += 1
+                if early_stopping_cnt >= EARLY_STOP_THRESHOLD:
+                    early_stopping_flag = True
+            if early_stopping_flag:
+                LOG.debug(f'Early Stopping at Epoch {epoch}, no improvement in {EARLY_STOP_THRESHOLD} epochs') 
+                break
+        # Testing starts here
+        dset.set_mode('test')
+        # update epoch to the best performing epoch
+        epoch -= early_stopping_cnt
+        # load the state from the best performing epoch
+        model.load_state_dict(best_state)
+        test_loader = DataLoader(dset, batch_size=BATCH_SIZE, shuffle=False, collate_fn=collate_func)
+        test_acc = step(test_loader, model, optim, train=False)
+        all_folds_acc += test_acc
+        LOG.debug(f'Epoch {epoch}: [Test] Accuracy : {test_acc : {5}.{4}}')
+        # Save the best model
+        os.makedirs('models', exist_ok=True)
+        with open(f'models/hop{NUM_HOPS}_fold{fold_num + 1}_epoch{epoch}_acc{best_acc}.pth', 'wb') as fp:
+            torch.save(best_state, fp)
+    LOG.debug('Overall test accuracy over %d folds: %5.4f', NUM_FOLDS, all_folds_acc/NUM_FOLDS)
