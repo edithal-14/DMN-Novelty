@@ -3,15 +3,17 @@ Serialize DLND documents to include infersent sentence embeddings
 such that we can represent documents as matrices.
 Dumps relevant data into a pickle file, which will be loaded for
 creating a model.
+
+Run this script with python3 and pytorch 0.3 with GPU support
 """
 
-# Run this script with python2 only
 import logging
 import nltk
 import os
 import pickle
 import sys
 import torch
+torch.cuda.set_device(2)
 import xml.etree.ElementTree as ET
 from dlnd_logger import init_logger
 from itertools import chain
@@ -23,8 +25,8 @@ init_logger(LOG)
 HOME_DIR = "/home1/tirthankar"
 DLND_PATH = os.path.join(HOME_DIR, "Vignesh/TAP-DLND-1.0_LREC2018_modified")
 GLOVE_PATH = os.path.join(HOME_DIR, "glove.840B.300d.txt")
-ENCODER_DIR = os.path.join(HOME_DIR, "Vignesh/decom_attn/InferSent")
-ENCODER_PATH = os.path.join(ENCODER_DIR, "encoder/model_2048_attn.pickle")
+ENCODER_DIR = os.path.join(HOME_DIR, "Vignesh/InferSent")
+ENCODER_PATH = os.path.join(ENCODER_DIR, "models/model_2048_attn.pickle")
 SAVE_FILE_PATH = "dlnd_data.p"
 
 # Infersent should be in the path to load the encoder
@@ -61,7 +63,7 @@ def read_contents(new_docs):
     for doc_list in new_docs:
         doc_content = list()
         for doc in doc_list:
-            content = open(doc, "r").read().decode("utf-8", "ignore")
+            content = open(doc, 'rb').read().decode('utf-8', 'ignore')
             doc_content.append(nltk.sent_tokenize(content))
         new_contents.append(list(chain.from_iterable(doc_content)))
     return new_contents
@@ -91,8 +93,9 @@ def get_sent_embs(tgt_docs, src_docs):
     tgt_contents = read_contents(tgt_docs)
     src_contents = read_contents(src_docs)
     LOG.debug('Loading encoder')
-    # I was unable to run infersent using pytorch with gpu support, so resorting to cpu only mode
-    infersent = torch.load(ENCODER_PATH, map_location=torch.device('cpu'))
+    infersent = torch.load(ENCODER_PATH)
+    # use the encoder network only
+    infersent = infersent.encoder
     LOG.debug('Loading glove vectors')
     infersent.set_glove_path(GLOVE_PATH)
     LOG.debug('Building vocab')
