@@ -4,8 +4,9 @@ Train DLND model
 
 import logging
 import os
+import pickle
 import torch
-torch.cuda.set_device(0)
+torch.cuda.set_device(5)
 import torch.nn as nn
 import torch.nn.functional as F
 import torch.nn.init as init
@@ -208,7 +209,7 @@ class DMNPlus(nn.Module):
         _, pred_ids = torch.max(preds, dim=1)
         corrects = (pred_ids.data == answers.data)
         acc = torch.mean(corrects.float())
-        return loss + reg_loss, acc
+        return loss + reg_loss, acc, pred_ids.data
 
 def step(dataloader, model, optim, train=True):
     """Runs single step on the dataset
@@ -224,6 +225,7 @@ def step(dataloader, model, optim, train=True):
     """
     total_acc = 0
     cnt = 0
+    all_preds = []
     for batch_idx, data in enumerate(dataloader):
         optim.zero_grad()
         _, _, src, tgt, answers = data
@@ -231,15 +233,16 @@ def step(dataloader, model, optim, train=True):
         src = Variable(src.cuda())
         tgt = Variable(tgt.cuda())
         answers = Variable(answers.cuda())
-        loss, acc = model.get_loss(src, tgt, answers)
+        loss, acc, preds = model.get_loss(src, tgt, answers)
+        all_preds.extend(preds.tolist())
         total_acc += acc * batch_size
         cnt += batch_size
         if train:
             loss.backward()
             if batch_idx % 20 == 0:
-                LOG.debug(f'Training loss : {loss.data.item(): {10}.{8}}, acc : {total_acc / cnt: {5}.{4}}, batch_idx : {batch_idx}')
+                LOG.debug(f'Training loss : {loss.data.item(): {5}.{4}}, acc: {total_acc / cnt: {5}.{4}}, batch_idx: {batch_idx}')
             optim.step()
-    return total_acc / cnt
+    return total_acc / cnt, all_preds
 
 if __name__ == "__main__":
     # Config variables
@@ -258,6 +261,7 @@ if __name__ == "__main__":
     hidden_size = dset.hidden
     # collect acuracy across all the folds
     all_folds_acc = 0
+    # Training and validation starts here
     for fold_num in range(NUM_FOLDS):
         # define the model
         model = DMNPlus(hidden_size, num_hop=NUM_HOPS)
@@ -269,8 +273,9 @@ if __name__ == "__main__":
         early_stopping_flag = False
         best_acc = 0
         optim = torch.optim.Adam(model.parameters())
-        # Get the current fold of data to use
-        dset.next_fold()
+        if fold_num > 0:
+            # Get the current fold of data to use
+            dset.next_fold()
         LOG.debug('Fold no: %d', fold_num + 1)
         # Training starts here
         for epoch in range(EPOCH_OFFSET, NUM_EPOCHS+EPOCH_OFFSET):
@@ -279,14 +284,14 @@ if __name__ == "__main__":
             train_loader = DataLoader(dset, batch_size=BATCH_SIZE, shuffle=True, collate_fn=collate_func)
             model.train()
             LOG.debug(f'Epoch {epoch}')
-            acc = step(train_loader, model, optim, train=True)
-
+            step(train_loader, model, optim, train=True)
             # Validation step
             dset.set_mode('valid')
             valid_loader = DataLoader(dset, batch_size=BATCH_SIZE, shuffle=False, collate_fn=collate_func)
             model.eval()
-            acc = step(valid_loader, model, optim, train=False)
-            LOG.debug(f'Epoch {epoch}: [Validate] Accuracy : {acc: {5}.{4}}')
+            acc, _ = step(valid_loader, model, optim, train=False)
+            LOG.debug(f'Validation Accuracy : {acc: {5}.{4}}')
+            # Save best model and stop early
             if acc > best_acc:
                 best_acc = acc
                 best_state = model.state_dict()
@@ -300,16 +305,20 @@ if __name__ == "__main__":
                 break
         # Testing starts here
         dset.set_mode('test')
-        # update epoch to the best performing epoch
-        epoch -= early_stopping_cnt
-        # load the state from the best performing epoch
-        model.load_state_dict(best_state)
         test_loader = DataLoader(dset, batch_size=BATCH_SIZE, shuffle=False, collate_fn=collate_func)
-        test_acc = step(test_loader, model, optim, train=False)
+        # Load the best performing model
+        model.load_state_dict(best_state)
+        model.eval()
+        test_acc, test_preds = step(test_loader, model, optim, train=False)
         all_folds_acc += test_acc
-        LOG.debug(f'Epoch {epoch}: [Test] Accuracy : {test_acc : {5}.{4}}')
+        LOG.debug(f'Testing Accuracy : {test_acc: {5}.{4}}')
         # Save the best model
         os.makedirs('models', exist_ok=True)
-        with open(f'models/hop{NUM_HOPS}_fold{fold_num + 1}_epoch{epoch}_acc{best_acc}.pth', 'wb') as fp:
+        test_filename = f'fold{fold_num+1}_test_acc{test_acc:{5}.{4}}'
+        with open(f'models/{test_filename}.pth', 'wb') as fp:
             torch.save(best_state, fp)
+        # Save the predictions
+        os.makedirs('predictions', exist_ok=True)
+        # test_preds is an array containing the predictions for the test data for the current fold
+        pickle.dump([test_preds], open(f'predictions/{test_filename}.p', "wb"))
     LOG.debug('Overall test accuracy over %d folds: %5.4f', NUM_FOLDS, all_folds_acc/NUM_FOLDS)

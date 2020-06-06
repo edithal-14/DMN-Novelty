@@ -64,13 +64,6 @@ def split_data(data):
     train_data, test_data = split_stratify_data(data)
     # Valid data is 10% of Train data
     train_data, valid_data = split_stratify_data(train_data)
-    # Print split sizes
-    train_size = len(train_data[0])
-    LOG.debug('Train data size: %d', train_size)
-    valid_size = len(valid_data[0])
-    LOG.debug('Valid data size: %d', valid_size)
-    test_size = len(test_data[0])
-    LOG.debug('Test data size: %d', test_size)
     return train_data, valid_data, test_data
 
 def pad_collate(batch, vocab):
@@ -131,25 +124,28 @@ class DLND(Dataset):
         self.data, self.vocab = get_dlnd_data()
         # Set self.hidden = embedding size = self.vocab.shape[1]
         self.hidden = self.vocab.shape[1]
-        LOG.debug('Sentence Embedding dimension: %d', self.hidden)
-        LOG.debug('Total data size: %d', len(self.data[0]))
         if folds <= 1:
             # Set splitting type
             self.split_type = 'ninety-ten'
-            # Set self.{train|valid|test}
             self.train, self.valid, self.test = split_data(self.data)
+            LOG.debug('Will do ninety ten split')
         else:
             # Set splitting type
             self.split_type = 'kfold'
-            # Set self.folds
-            self.curr_fold = -1
             # golds = data[-1]
             skf = StratifiedKFold(
                 n_splits=folds,
                 random_state=RANDOM_SEED,
                 shuffle=True)
             self.folds = skf.split(np.zeros(len(self.data[0])), self.data[-1])
-            LOG.debug('Number of folds created: %d', folds)
+            self.next_fold()
+            LOG.debug('Will do %d fold cross validation', folds)
+        # Log data set size details
+        LOG.debug('Sentence Embedding dimension: %d', self.hidden)
+        LOG.debug('Total data size: %d', len(self.data[0]))
+        LOG.debug('Train data size: %d', len(self.train[0]))
+        LOG.debug('Valid data size: %d', len(self.valid[0]))
+        LOG.debug('Test data size: %d', len(self.test[0]))
 
     def set_mode(self, mode):
         """
@@ -165,12 +161,13 @@ class DLND(Dataset):
         if not self.split_type == 'kfold':
             LOG.error('KFold splitting is not enabled')
             return
-        self.curr_fold += 1
         try:
             train_idx, test_idx = next(self.folds)
         except StopIteration:
             LOG.error('No more folds to process')
             return
+        random.shuffle(train_idx)
+        random.shuffle(test_idx)
         train_size = int(len(train_idx) * 0.9)
         valid_idx = train_idx[train_size:]
         train_idx = train_idx[:train_size]
