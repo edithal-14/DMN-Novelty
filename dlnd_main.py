@@ -5,16 +5,28 @@ Train DLND model
 import logging
 import os
 import pickle
+import sys
 import torch
-torch.cuda.set_device(5)
+torch.cuda.set_device(6)
 import torch.nn as nn
 import torch.nn.functional as F
 import torch.nn.init as init
+import warnings
 from functools import partial
 from torch.autograd import Variable
 from torch.utils.data import DataLoader
 from dlnd_loader import DLND, pad_collate
 from dlnd_logger import init_logger
+
+# Suppress all warnings
+warnings.simplefilter('ignore')
+
+# Config variables
+HOME_DIR = "/home1/tirthankar"
+ENCODER_DIR = os.path.join(HOME_DIR, "Vignesh/InferSent")
+ENCODER_PATH = os.path.join(ENCODER_DIR, "models/model_2048_attn.pickle")
+# Infersent should be in the path
+sys.path.append(ENCODER_DIR)
 
 LOG = logging.getLogger()
 init_logger(LOG)
@@ -82,22 +94,22 @@ class EpisodicMemory(nn.Module):
         init.xavier_normal(self.z2.state_dict()['weight'])
         init.xavier_normal(self.next_mem.state_dict()['weight'])
 
-    def make_interaction(self, facts, questions, prevM):
+    def make_interaction(self, facts, question, prevM):
         '''
         facts.size() -> (#batch, #sentence, #hidden = #embedding)
-        questions.size() -> (#batch, 1, #hidden)
+        question.size() -> (#batch, 1, #hidden)
         prevM.size() -> (#batch, #sentence = 1, #hidden = #embedding)
         z.size() -> (#batch, #sentence, 4 x #embedding)
         G.size() -> (#batch, #sentence)
         '''
         batch_num, sen_num, embedding_size = facts.size()
-        questions = questions.expand_as(facts)
+        question = question.expand_as(facts)
         prevM = prevM.expand_as(facts)
 
         z = torch.cat([
-            facts * questions,
+            facts * question,
             facts * prevM,
-            torch.abs(facts - questions),
+            torch.abs(facts - question),
             torch.abs(facts - prevM)
         ], dim=2)
 
@@ -110,36 +122,35 @@ class EpisodicMemory(nn.Module):
 
         return G
 
-    def forward(self, facts, questions, prevM):
+    def forward(self, facts, question, prevM):
         '''
         facts.size() -> (#batch, #sentence, #hidden = #embedding)
-        questions.size() -> (#batch, #sentence = 1, #hidden)
+        question.size() -> (#batch, #sentence = 1, #hidden)
         prevM.size() -> (#batch, #sentence = 1, #hidden = #embedding)
         G.size() -> (#batch, #sentence)
         C.size() -> (#batch, #hidden)
         concat.size() -> (#batch, 3 x #embedding)
         '''
-        G = self.make_interaction(facts, questions, prevM)
+        G = self.make_interaction(facts, question, prevM)
         C = self.AGRU(facts, G)
-        concat = torch.cat([prevM.squeeze(1), C, questions.squeeze(1)], dim=1)
+        concat = torch.cat([prevM.squeeze(1), C, question.squeeze(1)], dim=1)
         next_mem = F.relu(self.next_mem(concat))
         next_mem = next_mem.unsqueeze(1)
         return next_mem
 
-
-class QuestionModule(nn.Module):
-    def __init__(self, hidden_size):
-        super(QuestionModule, self).__init__()
-        self.gru = nn.GRU(hidden_size, hidden_size, batch_first=True)
-
-    def forward(self, questions):
-        '''
-        questions.size() -> (#batch, #sentence, #embedding)
-        gru() -> (1, #batch, #hidden)
-        '''
-        _, questions = self.gru(questions)
-        questions = questions.transpose(0, 1)
-        return questions
+# class QuestionModule(nn.Module):
+#     def __init__(self, hidden_size):
+#         super(QuestionModule, self).__init__()
+#         self.gru = nn.GRU(hidden_size, hidden_size, batch_first=True)
+# 
+#     def forward(self, questions):
+#         '''
+#         questions.size() -> (#batch, #sentence, #embedding)
+#         gru() -> (1, #batch, #hidden)
+#         '''
+#         _, questions = self.gru(questions)
+#         questions = questions.transpose(0, 1)
+#         return questions
 
 class InputModule(nn.Module):
     def __init__(self, hidden_size):
@@ -149,13 +160,38 @@ class InputModule(nn.Module):
         for name, param in self.gru.state_dict().items():
             if 'weight' in name: init.xavier_normal(param)
         self.dropout = nn.Dropout(0.1)
+        infersent = torch.load(ENCODER_PATH).cuda()
+        self.entailment = infersent.classifier
 
-    def forward(self, contexts):
+    def prune_contexts(self, contexts, question):
+        # prune the number of sentences in contexts to min(#context,10)
+        # based on their entailment scores w.r.t question
+        # question and contexts should have same dimensionality for feature extraction
+        question = question.expand(contexts.size())
+        features = torch.cat((contexts, question, torch.abs(contexts - question), contexts * question), 2)
+        batch_num, sent_num, embedding_dim = features.size()
+        topn = min(sent_num, 10)
+        # unbatch features
+        squashed_features = features.view(batch_num*sent_num, embedding_dim)
+        entailment_scores = self.entailment(squashed_features)[:,0]
+        # batch up entailment scores
+        entailment_scores = entailment_scores.view(batch_num, sent_num)
+        _, contexts_ids = torch.topk(entailment_scores, topn)
+        # create new contexts tensor by selecting the appropriate indices
+        batch_num, sent_num, embedding_dim = contexts.size()
+        topn = min(sent_num, 10)
+        pruned_contexts = torch.zeros(batch_num, topn, embedding_dim).cuda()
+        for i in range(batch_num):
+            pruned_contexts[i] = contexts[i].index_select(0, contexts_ids[i])
+        return pruned_contexts
+
+    def forward(self, contexts, question):
         '''
         contexts.size() -> (#batch, #context, #embedding)
+        question.size() -> (#batch, #embedding)
         facts.size() -> (#batch, #context, #hidden)
         '''
-        batch_num, context_num, embedding_dim = contexts.size()
+        contexts = self.prune_contexts(contexts, question)
         contexts = self.dropout(contexts)
         facts, hdn = self.gru(contexts)
         facts = facts[:, :, :self.hidden_size] + facts[:, :, self.hidden_size:]
@@ -164,40 +200,90 @@ class InputModule(nn.Module):
 class AnswerModule(nn.Module):
     def __init__(self, hidden_size):
         super(AnswerModule, self).__init__()
-        self.z = nn.Linear(2 * hidden_size, 2)
-        init.xavier_normal(self.z.state_dict()['weight'])
+        # self.z = nn.Linear(2 * hidden_size, 2)
+        # init.xavier_normal(self.z.state_dict()['weight'])
         self.dropout = nn.Dropout(0.1)
 
-    def forward(self, M, questions):
-        M = self.dropout(M)
-        concat = torch.cat([M, questions], dim=2).squeeze(1)
-        z = self.z(concat)
-        return z
+    def forward(self, memory, question):
+        memory = self.dropout(memory)
+        concat = torch.cat([memory, question], dim=2).squeeze(1)
+        # z = self.z(concat)
+        return concat
 
-class DMNPlus(nn.Module):
-    def __init__(self, hidden_size, num_hop=3, qa=None):
-        super(DMNPlus, self).__init__()
-        self.num_hop = num_hop
-        self.qa = qa
-        self.criterion = nn.CrossEntropyLoss(size_average=False)
-
+class DMNEncoder(nn.Module):
+    def __init__(self, hidden_size, num_hop):
+        super(DMNEncoder, self).__init__()
         self.input_module = InputModule(hidden_size)
-        self.question_module = QuestionModule(hidden_size)
         self.memory = EpisodicMemory(hidden_size)
         self.answer_module = AnswerModule(hidden_size)
+        self.num_hop = num_hop
+
+    def forward(self, src, question):
+        facts = self.input_module(src, question)
+        memory = question
+        for hop in range(self.num_hop):
+            memory = self.memory(facts, question, memory)
+        output = self.answer_module(memory, question)
+        return output
+
+class CNNEncoder(nn.Module):
+    """
+    Apply convolution + max pool
+    """
+    def __init__(self, hidden_size, num_filters, filter_sizes):
+        super(CNNEncoder, self).__init__()
+        self.convs = nn.ModuleList()
+        for filter_size in filter_sizes:
+            self.convs.append(nn.Conv2d(1, num_filters, (filter_size, hidden_size)))
+        self.fc = nn.Linear(len(filter_sizes) * num_filters, 2)
+        init.xavier_normal(self.fc.state_dict()['weight'])
+
+    def forward(self, rdv):
+        """
+        rdv = (#batch, #sentence, #embedding)
+        feature_vector = (#batch, len(filter_sizes) * #num_filters)
+        output = (#batch, 2)
+        """
+        # Add a channel dimension
+        rdv = rdv.unsqueeze(1)
+        feature_vectors = list()
+        for conv in self.convs:
+            feature = F.relu(conv(rdv))
+            feature = feature.squeeze(-1)
+            feature = F.max_pool1d(feature, feature.size()[2])
+            feature = feature.squeeze(-1)
+            feature_vectors.append(feature)
+        feature_vector = torch.cat(feature_vectors, 1)
+        output = self.fc(feature_vector)
+        return output
+
+class DMNPlus(nn.Module):
+    def __init__(self, hidden_size, num_hop=3):
+        super(DMNPlus, self).__init__()
+        self.num_hop = num_hop
+        self.criterion = nn.CrossEntropyLoss(size_average=False)
+        self.mem_encoder = DMNEncoder(hidden_size, num_hop)
+        self.cnn_encoder = CNNEncoder(2 * hidden_size, num_filters=200, filter_sizes=[3,4,5])
+        # self.question_module = QuestionModule(hidden_size)
 
     def forward(self, src, tgt):
         '''
+        tgt.size() -> (#batch, #sentence, #embedding) -> (#batch, 1, #hidden)
         src.size() -> (#batch, #sentence, #embedding) -> (#batch, #sentence, #hidden)
-        tgt.size() -> (#batch, #sentence, #embedding) -> (1, #batch, #hidden)
+        encoding.size() -> (#batch, 2 * #embedding)
+        rdv.size() -> (#batch, #sentence, 2 * #embedding)
+        output.size() -> (#batch, 2)
         '''
-        facts = self.input_module(src)
-        questions = self.question_module(tgt)
-        M = questions
-        for hop in range(self.num_hop):
-            M = self.memory(facts, questions, M)
-        preds = self.answer_module(M, questions)
-        return preds
+        batch_num, sent_num, embedding_dim = tgt.size()
+        # rdv = Relative document vector
+        rdv = torch.zeros(batch_num, sent_num, 2 * embedding_dim).cuda()
+        for i in range(sent_num):
+            question = tgt.index_select(1, torch.tensor([i]).cuda())
+            encoding = self.mem_encoder(src, question)
+            for j in range(batch_num):
+                rdv[j][i] = encoding[j]
+        output = self.cnn_encoder(rdv)
+        return output
 
     def get_loss(self, src, tgt, answers):
         output = self.forward(src, tgt)
@@ -224,6 +310,7 @@ def step(dataloader, model, optim, train=True):
     float: accuracy of the model
     """
     total_acc = 0
+    total_loss = 0
     cnt = 0
     all_preds = []
     for batch_idx, data in enumerate(dataloader):
@@ -236,12 +323,17 @@ def step(dataloader, model, optim, train=True):
         loss, acc, preds = model.get_loss(src, tgt, answers)
         all_preds.extend(preds.tolist())
         total_acc += acc * batch_size
+        total_loss += loss.data.item() * batch_size
         cnt += batch_size
         if train:
             loss.backward()
-            if batch_idx % 20 == 0:
-                LOG.debug(f'Training loss : {loss.data.item(): {5}.{4}}, acc: {total_acc / cnt: {5}.{4}}, batch_idx: {batch_idx}')
+            if batch_idx % 80 == 0:
+                LOG.debug(f'Training loss : {total_loss / cnt: {5}.{4}}, acc: {total_acc / cnt: {5}.{4}}, batch_idx: {batch_idx}')
             optim.step()
+    if train:
+        LOG.debug(f'Training loss : {total_loss / cnt: {5}.{4}}, acc: {total_acc / cnt: {5}.{4}}, batch_idx: {batch_idx}')
+    else:
+        LOG.debug(f'Loss : {total_loss / cnt: {5}.{4}}, acc: {total_acc / cnt: {5}.{4}}, batch_idx: {batch_idx}')
     return total_acc / cnt, all_preds
 
 if __name__ == "__main__":
@@ -249,7 +341,7 @@ if __name__ == "__main__":
     NUM_FOLDS = 10
     NUM_HOPS = 4
     NUM_EPOCHS = 25
-    BATCH_SIZE = 32
+    BATCH_SIZE = 8
     EARLY_STOP_THRESHOLD = 10
     PRE_TRAINED_MODEL = None
     EPOCH_OFFSET = 1
