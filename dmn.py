@@ -1,13 +1,37 @@
 """
-Train DLND model
+Run DMN model
+Command: python dmn.py <dataset_name>
 """
 
-import logging
+# Config variables
 import os
-import pickle
 import sys
+
+NUM_FOLDS = 10
+NUM_HOPS = 4
+NUM_EPOCHS = 25
+BATCH_SIZE = 8
+EARLY_STOP_THRESHOLD = 10
+PRE_TRAINED_MODEL = None
+EPOCH_OFFSET = 1
+GPU_ID = 2
+DATASET_NAME = sys.argv[1]
+if DATASET_NAME == 'DLND':
+    LOGFILE = 'dlnd/dlnd_logs'
+elif DATASET_NAME == 'APWSJ':
+    LOGFILE = 'apwsj/apwsj_logs'
+else:
+    raise Exception('Dataset name %s is not supported!' % DATASET_NAME)
+HOME_DIR = "/home1/tirthankar"
+ENCODER_DIR = os.path.join(HOME_DIR, "Vignesh/InferSent")
+ENCODER_PATH = os.path.join(ENCODER_DIR, "models/model_2048_attn.pickle")
+# Infersent should be in the path
+sys.path.append(ENCODER_DIR)
+
+import logging
+import pickle
 import torch
-torch.cuda.set_device(6)
+torch.cuda.set_device(GPU_ID)
 import torch.nn as nn
 import torch.nn.functional as F
 import torch.nn.init as init
@@ -15,21 +39,15 @@ import warnings
 from functools import partial
 from torch.autograd import Variable
 from torch.utils.data import DataLoader
-from dlnd_loader import DLND, pad_collate
-from dlnd_logger import init_logger
+from loader import DmnData, pad_collate
+from logger import init_logger
 
 # Suppress all warnings
 warnings.simplefilter('ignore')
 
-# Config variables
-HOME_DIR = "/home1/tirthankar"
-ENCODER_DIR = os.path.join(HOME_DIR, "Vignesh/InferSent")
-ENCODER_PATH = os.path.join(ENCODER_DIR, "models/model_2048_attn.pickle")
-# Infersent should be in the path
-sys.path.append(ENCODER_DIR)
-
+# Initialize logging
 LOG = logging.getLogger()
-init_logger(LOG)
+init_logger(LOG, LOGFILE)
 
 class AttentionGRUCell(nn.Module):
     def __init__(self, input_size, hidden_size):
@@ -142,7 +160,7 @@ class EpisodicMemory(nn.Module):
 #     def __init__(self, hidden_size):
 #         super(QuestionModule, self).__init__()
 #         self.gru = nn.GRU(hidden_size, hidden_size, batch_first=True)
-# 
+#
 #     def forward(self, questions):
 #         '''
 #         questions.size() -> (#batch, #sentence, #embedding)
@@ -179,7 +197,6 @@ class InputModule(nn.Module):
         _, contexts_ids = torch.topk(entailment_scores, topn)
         # create new contexts tensor by selecting the appropriate indices
         batch_num, sent_num, embedding_dim = contexts.size()
-        topn = min(sent_num, 10)
         pruned_contexts = torch.zeros(batch_num, topn, embedding_dim).cuda()
         for i in range(batch_num):
             pruned_contexts[i] = contexts[i].index_select(0, contexts_ids[i])
@@ -188,7 +205,7 @@ class InputModule(nn.Module):
     def forward(self, contexts, question):
         '''
         contexts.size() -> (#batch, #context, #embedding)
-        question.size() -> (#batch, #embedding)
+        # question.size() -> (#batch, #embedding)
         facts.size() -> (#batch, #context, #hidden)
         '''
         contexts = self.prune_contexts(contexts, question)
@@ -263,7 +280,7 @@ class DMNPlus(nn.Module):
         self.num_hop = num_hop
         self.criterion = nn.CrossEntropyLoss(size_average=False)
         self.mem_encoder = DMNEncoder(hidden_size, num_hop)
-        self.cnn_encoder = CNNEncoder(2 * hidden_size, num_filters=200, filter_sizes=[3,4,5])
+        self.cnn_encoder = CNNEncoder(2 * hidden_size, num_filters=200, filter_sizes=[3, 4, 5])
         # self.question_module = QuestionModule(hidden_size)
 
     def forward(self, src, tgt):
@@ -337,16 +354,8 @@ def step(dataloader, model, optim, train=True):
     return total_acc / cnt, all_preds
 
 if __name__ == "__main__":
-    # Config variables
-    NUM_FOLDS = 10
-    NUM_HOPS = 4
-    NUM_EPOCHS = 25
-    BATCH_SIZE = 8
-    EARLY_STOP_THRESHOLD = 10
-    PRE_TRAINED_MODEL = None
-    EPOCH_OFFSET = 1
-    # Initialise DLND data
-    dset = DLND(folds=NUM_FOLDS)
+    # Initialise data
+    dset = DmnData(DATASET_NAME, folds=NUM_FOLDS)
     collate_func = partial(pad_collate, vocab=dset.vocab)
     # Model parameters
     # hidden_size = sentence embedding dimension
@@ -393,7 +402,7 @@ if __name__ == "__main__":
                 if early_stopping_cnt >= EARLY_STOP_THRESHOLD:
                     early_stopping_flag = True
             if early_stopping_flag:
-                LOG.debug(f'Early Stopping at Epoch {epoch}, no improvement in {EARLY_STOP_THRESHOLD} epochs') 
+                LOG.debug(f'Early Stopping at Epoch {epoch}, no improvement in {EARLY_STOP_THRESHOLD} epochs')
                 break
         # Testing starts here
         dset.set_mode('test')
@@ -405,12 +414,12 @@ if __name__ == "__main__":
         all_folds_acc += test_acc
         LOG.debug(f'Testing Accuracy : {test_acc: {5}.{4}}')
         # Save the best model
-        os.makedirs('models', exist_ok=True)
+        os.makedirs(os.path.join(DATASET_NAME.lower(), 'models'), exist_ok=True)
         test_filename = f'fold{fold_num+1}_test_acc{test_acc:{5}.{4}}'
-        with open(f'models/{test_filename}.pth', 'wb') as fp:
+        with open(f'{DATASET_NAME.lower()}/models/{test_filename}.pth', 'wb') as fp:
             torch.save(best_state, fp)
         # Save the predictions
-        os.makedirs('predictions', exist_ok=True)
+        os.makedirs(os.path.join(DATASET_NAME.lower(), 'predictions'), exist_ok=True)
         # test_preds is an array containing the predictions for the test data for the current fold
-        pickle.dump([test_preds], open(f'predictions/{test_filename}.p', "wb"))
+        pickle.dump([test_preds], open(f'{DATASET_NAME.lower()}/predictions/{test_filename}.p', "wb"))
     LOG.debug('Overall test accuracy over %d folds: %5.4f', NUM_FOLDS, all_folds_acc/NUM_FOLDS)

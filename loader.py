@@ -1,7 +1,8 @@
 """
-Pytorch Dataset class for DLND data
+Pytorch Dataset class for input to the DMN model
 """
 
+from itertools import chain
 import logging
 import pickle
 import random
@@ -12,17 +13,22 @@ from torch.utils.data.dataloader import default_collate
 
 LOG = logging.getLogger()
 # GLOBAL VARIABLES
-DLND_DATA = 'dlnd_data.p'
+DLND_DATA = 'dlnd/dlnd_data.p'
+APWSJ_DATA = 'apwsj/apwsj_data.p'
 RANDOM_SEED = 1234
 
-def oversample_novel(data):
+def oversample(data, minority_class):
     """
-    Random oversampling of minority class (novel class: 1)
+    Random oversampling of minority class
+    class labels:
+    0: non-novel class
+    1: novel class
     """
     random.seed(RANDOM_SEED)
     answers = data[-1]
-    n_samples_add = len(answers) - (2 * sum(answers))
-    minority_ids = [idx for idx, answer in enumerate(answers) if answer]
+    n_minority = len([answer for answer in answers if answer == minority_class])
+    n_samples_add = len(answers) - (2 * n_minority)
+    minority_ids = [idx for idx, answer in enumerate(answers) if answer == minority_class]
     random_ids = random.choices(minority_ids, k=n_samples_add)
     for item_no, _ in enumerate(data):
         data[item_no] += [data[item_no][idx] for idx in random_ids]
@@ -54,7 +60,49 @@ def get_dlnd_data():
             = pickle.load(open(DLND_DATA, 'rb'), encoding='latin1')
     # random oversampling of minority class (novel class: 1)
     data = [src_docs, tgt_docs, src_ids, tgt_ids, golds]
-    return oversample_novel(data), vocab
+    return oversample(data, 1), vocab
+
+
+def get_apwsj_data():
+    """
+    Read the apwsj data from the pickle file and pre-process it
+    """
+    # Consider only the latest max_context_size number
+    # of sentences as the context for a document
+    max_context_size = 200
+    # Consider only the latest max_question_size number
+    # of sentences in a document
+    max_question_size = 100
+    # Add encoding='latin1' to unpickle a file in python3 which was picklized in python2
+    # data = [docs, contexts, questions, vocab, golds]
+    docs, contexts, questions, vocab, golds = pickle.load(open(APWSJ_DATA, 'rb'), encoding='latin1')
+    # Trim the number of sentences in each question
+    for idx, question in enumerate(questions):
+        questions[idx] = question[-max_question_size:]
+    # Stack all the sentence_ids of each context document for a target document
+    # Trim the number of sentences
+    remove_ids = list()
+    # context documents for each question
+    context_docs = list()
+    for idx, context in enumerate(contexts):
+        # Record the indices which dont have any context
+        # to delete them later
+        if len(context) == 0:
+            remove_ids.append(idx)
+        sent_ids = [questions[question_idx] for question_idx in context]
+        contexts[idx] = list(chain.from_iterable(sent_ids))[-max_context_size:]
+        context_doc = [docs[question_idx] for question_idx in context]
+        context_docs.append(context_doc)
+    # Remove the indices in remove_ids
+    for idx in remove_ids[::-1]:
+        del context_docs[idx]
+        del docs[idx]
+        del contexts[idx]
+        del questions[idx]
+        del golds[idx]
+    # random oversampling of minority class (non-novel class: 0)
+    data = [context_docs, docs, contexts, questions, golds]
+    return oversample(data, 0), vocab
 
 def split_data(data):
     """
@@ -112,16 +160,20 @@ def pad_collate(batch, vocab):
         batch[i] = (src_docs, tgt_docs, src, tgt, answers)
     return default_collate(batch)
 
-class DLND(Dataset):
+class DmnData(Dataset):
     """
-    Pytorch Dataset class for DLND data:
+    Pytorch Dataset class for input to the DMN model:
 
     Supports k fold cross validation when folds > 1
     """
-    def __init__(self, mode='train', folds=1):
+    def __init__(self, dataset_name, mode='train', folds=1):
         self.mode = mode
-        # self.data = docs, src_ids, tgt_ids, golds
-        self.data, self.vocab = get_dlnd_data()
+        if dataset_name == 'DLND':
+            self.data, self.vocab = get_dlnd_data()
+        elif dataset_name == 'APWSJ':
+            self.data, self.vocab = get_apwsj_data()
+        else:
+            raise Exception('Dataset name %s is not supported!' % dataset_name)
         # Set self.hidden = embedding size = self.vocab.shape[1]
         self.hidden = self.vocab.shape[1]
         if folds <= 1:
