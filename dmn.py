@@ -39,6 +39,7 @@ import warnings
 from functools import partial
 from torch.autograd import Variable
 from torch.utils.data import DataLoader
+from torch.utils.checkpoint import checkpoint
 from loader import DmnData, pad_collate
 from logger import init_logger
 
@@ -182,25 +183,49 @@ class InputModule(nn.Module):
         self.entailment = infersent.classifier
 
     def prune_contexts(self, contexts, question):
-        # prune the number of sentences in contexts to min(#context,10)
-        # based on their entailment scores w.r.t question
+        """
+        1. Prune the top 10 context sentences based on the entailment score w.r.t question
+        2. Add +/- 5 sentences as context for each sentence selected above
+        3. Pad the final context matrix to the size of the biggest context matrix
+        """
+        num_batch, num_sent, embedding_dim = contexts.size()
+        # select topn context sentences
+        topn = min(num_sent, 10)
+        # context size for topn context sentences
+        topn_context_size = 5
         # question and contexts should have same dimensionality for feature extraction
         question = question.expand(contexts.size())
-        features = torch.cat((contexts, question, torch.abs(contexts - question), contexts * question), 2)
-        batch_num, sent_num, embedding_dim = features.size()
-        topn = min(sent_num, 10)
-        # unbatch features
-        squashed_features = features.view(batch_num*sent_num, embedding_dim)
-        entailment_scores = self.entailment(squashed_features)[:,0]
-        # batch up entailment scores
-        entailment_scores = entailment_scores.view(batch_num, sent_num)
-        _, contexts_ids = torch.topk(entailment_scores, topn)
-        # create new contexts tensor by selecting the appropriate indices
-        batch_num, sent_num, embedding_dim = contexts.size()
-        pruned_contexts = torch.zeros(batch_num, topn, embedding_dim).cuda()
-        for i in range(batch_num):
-            pruned_contexts[i] = contexts[i].index_select(0, contexts_ids[i])
-        return pruned_contexts
+        features = torch.cat(
+            (contexts, question, torch.abs(contexts - question), contexts * question), 2)
+        # unbatch features and calculate entailment scores then batch up the entailment scores
+        squashed_features = features.view(num_batch * num_sent, 4 * embedding_dim)
+        entailment_scores = self.entailment(squashed_features)[:, 0]
+        entailment_scores = entailment_scores.view(num_batch, num_sent)
+        _, sentence_ids = torch.topk(entailment_scores, topn)
+        # Add +/- 5 sentences to each id
+        contextualized_sentence_ids = []
+        max_num_ids = 0
+        for i in range(num_batch):
+            ids = torch.cuda.LongTensor([])
+            for idx in sentence_ids[i]:
+                prev_ids = torch.arange(max(0, idx - topn_context_size), idx).cuda()
+                ids = torch.cat((ids, prev_ids))
+                next_ids = torch.arange(idx, min(idx + topn_context_size + 1, num_sent)).cuda()
+                ids = torch.cat((ids, next_ids))
+            # Remove duplicate sentence indices
+            ids = torch.unique(ids, sorted=True)
+            num_ids = ids.size()[0]
+            if num_ids > max_num_ids:
+                max_num_ids = num_ids
+            contextualized_sentence_ids.append(ids)
+        # apply padding based on max_num_ids
+        padded_contextualized_pruned_contexts = \
+                torch.zeros(num_batch, max_num_ids, embedding_dim).cuda()
+        for i in range(num_batch):
+            num_ids = contextualized_sentence_ids[i].size()[0]
+            padded_contextualized_pruned_contexts[i][max_num_ids - num_ids : max_num_ids] = \
+                    contexts[i].index_select(0, contextualized_sentence_ids[i])
+        return padded_contextualized_pruned_contexts
 
     def forward(self, contexts, question):
         '''
@@ -296,7 +321,7 @@ class DMNPlus(nn.Module):
         rdv = torch.zeros(batch_num, sent_num, 2 * embedding_dim).cuda()
         for i in range(sent_num):
             question = tgt.index_select(1, torch.tensor([i]).cuda())
-            encoding = self.mem_encoder(src, question)
+            encoding = checkpoint(self.mem_encoder, src, question)
             for j in range(batch_num):
                 rdv[j][i] = encoding[j]
         output = self.cnn_encoder(rdv)
