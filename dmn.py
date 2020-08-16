@@ -10,7 +10,7 @@ import sys
 NUM_FOLDS = 10
 NUM_HOPS = 4
 NUM_EPOCHS = 25
-BATCH_SIZE = 8
+BATCH_SIZE = 32
 EARLY_STOP_THRESHOLD = 10
 PRE_TRAINED_MODEL = None
 EPOCH_OFFSET = 1
@@ -38,6 +38,8 @@ import torch.nn.init as init
 import warnings
 from functools import partial
 from torch.autograd import Variable
+from torch.optim import Adam
+from torch.optim.lr_scheduler import ReduceLROnPlateau
 from torch.utils.data import DataLoader
 from torch.utils.checkpoint import checkpoint
 from loader import DmnData, pad_collate
@@ -190,7 +192,7 @@ class InputModule(nn.Module):
         """
         num_batch, num_sent, embedding_dim = contexts.size()
         # select topn context sentences
-        topn = min(num_sent, 10)
+        topn = min(num_sent, 20)
         # context size for topn context sentences
         topn_context_size = 5
         # question and contexts should have same dimensionality for feature extraction
@@ -239,25 +241,24 @@ class InputModule(nn.Module):
         facts = facts[:, :, :self.hidden_size] + facts[:, :, self.hidden_size:]
         return facts
 
-class AnswerModule(nn.Module):
-    def __init__(self, hidden_size):
-        super(AnswerModule, self).__init__()
-        # self.z = nn.Linear(2 * hidden_size, 2)
-        # init.xavier_normal(self.z.state_dict()['weight'])
-        self.dropout = nn.Dropout(0.1)
-
-    def forward(self, memory, question):
-        memory = self.dropout(memory)
-        concat = torch.cat([memory, question], dim=2).squeeze(1)
-        # z = self.z(concat)
-        return concat
+# class AnswerModule(nn.Module):
+#     def __init__(self, hidden_size):
+#         super(AnswerModule, self).__init__()
+#         # self.z = nn.Linear(2 * hidden_size, 2)
+#         # init.xavier_normal(self.z.state_dict()['weight'])
+#         # self.dropout = nn.Dropout(0.1)
+#
+#     def forward(self, memory, question):
+#         memory = self.dropout(memory)
+#         concat = torch.cat([memory, question], dim=2).squeeze(1)
+#         # z = self.z(concat)
+#         return concat
 
 class DMNEncoder(nn.Module):
     def __init__(self, hidden_size, num_hop):
         super(DMNEncoder, self).__init__()
         self.input_module = InputModule(hidden_size)
         self.memory = EpisodicMemory(hidden_size)
-        self.answer_module = AnswerModule(hidden_size)
         self.num_hop = num_hop
 
     def forward(self, src, question):
@@ -265,7 +266,7 @@ class DMNEncoder(nn.Module):
         memory = question
         for hop in range(self.num_hop):
             memory = self.memory(facts, question, memory)
-        output = self.answer_module(memory, question)
+        output = torch.cat([memory, question], dim=2).squeeze(1)
         return output
 
 class CNNEncoder(nn.Module):
@@ -279,6 +280,7 @@ class CNNEncoder(nn.Module):
             self.convs.append(nn.Conv2d(1, num_filters, (filter_size, hidden_size)))
         self.fc = nn.Linear(len(filter_sizes) * num_filters, 2)
         init.xavier_normal(self.fc.state_dict()['weight'])
+        self.dropout = nn.Dropout(0.1)
 
     def forward(self, rdv):
         """
@@ -296,6 +298,7 @@ class CNNEncoder(nn.Module):
             feature = feature.squeeze(-1)
             feature_vectors.append(feature)
         feature_vector = torch.cat(feature_vectors, 1)
+        feature_vector = self.dropout(feature_vector)
         output = self.fc(feature_vector)
         return output
 
@@ -306,7 +309,6 @@ class DMNPlus(nn.Module):
         self.criterion = nn.CrossEntropyLoss(size_average=False)
         self.mem_encoder = DMNEncoder(hidden_size, num_hop)
         self.cnn_encoder = CNNEncoder(2 * hidden_size, num_filters=200, filter_sizes=[3, 4, 5])
-        # self.question_module = QuestionModule(hidden_size)
 
     def forward(self, src, tgt):
         '''
@@ -398,7 +400,9 @@ if __name__ == "__main__":
         early_stopping_cnt = 0
         early_stopping_flag = False
         best_acc = 0
-        optim = torch.optim.Adam(model.parameters())
+        optim = Adam(model.parameters())
+        lr_decay = ReduceLROnPlateau(optim, mode='max', patience=3,
+                                     threshold_mode='abs', threshold=0.01, verbose=True)
         if fold_num > 0:
             # Get the current fold of data to use
             dset.next_fold()
@@ -417,6 +421,8 @@ if __name__ == "__main__":
             model.eval()
             acc, _ = step(valid_loader, model, optim, train=False)
             LOG.debug(f'Validation Accuracy : {acc: {5}.{4}}')
+            # Decay Learning rate
+            lr_decay.step(acc)
             # Save best model and stop early
             if acc > best_acc:
                 best_acc = acc
