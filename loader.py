@@ -1,7 +1,6 @@
 """
 Pytorch Dataset class for input to the DMN model
 """
-
 from itertools import chain
 import logging
 import pickle
@@ -15,6 +14,7 @@ LOG = logging.getLogger()
 # GLOBAL VARIABLES
 DLND_DATA = 'dlnd/dlnd_data.p'
 APWSJ_DATA = 'apwsj/apwsj_data.p'
+STE_DATA = 'ste/ste_data.p'
 RANDOM_SEED = 1234
 
 def oversample(data, minority_class):
@@ -52,7 +52,7 @@ def split_stratify_data(data):
 
 def get_dlnd_data():
     """
-    Read the dlnd data from the pickle file and pre-process it
+    Read the dlnd data from the pickle file and pre-process it.
     """
     # Add encoding='latin1' to unpickle a file in python3 which was picklized in python2
     # data = [src_docs, tgt_docs, src_ids, tgt_ids, vocab, golds]
@@ -65,7 +65,7 @@ def get_dlnd_data():
 
 def get_apwsj_data():
     """
-    Read the apwsj data from the pickle file and pre-process it
+    Read the apwsj data from the pickle file and pre-process it.
     """
     # Consider only the latest max_context_size number
     # of sentences as the context for a document
@@ -104,6 +104,16 @@ def get_apwsj_data():
     data = [context_docs, docs, contexts, questions, golds]
     return oversample(data, 0), vocab
 
+def get_ste_data():
+    """
+    Read the stackexchange data from the pickle file and pre-process it.
+    """
+    # data = [subtopics, tgt_ids, src_ids, vocab, golds]
+    subtopics, tgt_ids, src_ids, vocab, golds = pickle.load(open(STE_DATA, 'rb'), encoding='latin1')
+    data = [subtopics, src_ids, tgt_ids, golds]
+    # random oversample of minority class (non-novel class: 0)
+    return oversample(data, 0), vocab
+
 def split_data(data):
     """
     Split data into training, validation and testing data
@@ -121,6 +131,9 @@ def pad_collate(batch, vocab):
 
     2. Convert the sources and targets in the batch into matrices
     based on the sentence embeddings specified in the vocab
+
+    Note: 3rd last element of a batch entry should be the source sentence ids
+    and the 2nd last element should be the target sentence ids
     """
     # vocab = (#docs * #sents, #embedding)
     embedding_size = vocab.shape[1]
@@ -128,7 +141,10 @@ def pad_collate(batch, vocab):
     max_src_size = 0
     max_tgt_size = 0
     for i, elem in enumerate(batch):
-        _, _, src_ids, tgt_ids, _ = elem
+        # 3rd last element of the batch should be source sentences ids
+        src_ids = elem[-3]
+        # 2nd last element of the batch should be target sentences ids
+        tgt_ids = elem[-2]
         src_size = len(src_ids)
         tgt_size = len(tgt_ids)
         if src_size > max_src_size:
@@ -136,7 +152,10 @@ def pad_collate(batch, vocab):
         if tgt_size > max_tgt_size:
             max_tgt_size = tgt_size
     for i, elem in enumerate(batch):
-        src_docs, tgt_docs, src_ids, tgt_ids, answers = elem
+        # 3rd last element of the batch should be source sentences ids
+        src_ids = elem[-3]
+        # 2nd last element of the batch should be target sentences ids
+        tgt_ids = elem[-2]
         # Pad each source and target per their maximum sizes
         src_ids = [None] * (max_src_size - len(src_ids)) + src_ids
         tgt_ids = [None] * (max_tgt_size - len(tgt_ids)) + tgt_ids
@@ -157,7 +176,9 @@ def pad_collate(batch, vocab):
             else:
                 tgt_vec.append(pad_sent)
         tgt = np.vstack(tgt_vec)
-        batch[i] = (src_docs, tgt_docs, src, tgt, answers)
+        elem[-3] = src
+        elem[-2] = tgt
+        batch[i] = elem
     return default_collate(batch)
 
 class DmnData(Dataset):
@@ -172,6 +193,8 @@ class DmnData(Dataset):
             self.data, self.vocab = get_dlnd_data()
         elif dataset_name == 'APWSJ':
             self.data, self.vocab = get_apwsj_data()
+        elif dataset_name == 'STE':
+            self.data, self.vocab = get_ste_data()
         else:
             raise Exception('Dataset name %s is not supported!' % dataset_name)
         # Set self.hidden = embedding size = self.vocab.shape[1]

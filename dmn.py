@@ -7,7 +7,7 @@ Command: python dmn.py <dataset_name>
 import os
 import sys
 
-NUM_FOLDS = 10
+NUM_FOLDS = 1
 NUM_HOPS = 4
 NUM_EPOCHS = 25
 BATCH_SIZE = 32
@@ -18,8 +18,13 @@ GPU_ID = 2
 DATASET_NAME = sys.argv[1]
 if DATASET_NAME == 'DLND':
     LOGFILE = 'dlnd/dlnd_logs'
+    IS_SENTENCE_LEVEL = True
 elif DATASET_NAME == 'APWSJ':
     LOGFILE = 'apwsj/apwsj_logs'
+    IS_SENTENCE_LEVEL = True
+elif DATASET_NAME == 'STE':
+    LOGFILE = 'ste/ste_logs'
+    IS_SENTENCE_LEVEL = False
 else:
     raise Exception('Dataset name %s is not supported!' % DATASET_NAME)
 HOME_DIR = "/home1/tirthankar"
@@ -159,30 +164,32 @@ class EpisodicMemory(nn.Module):
         next_mem = next_mem.unsqueeze(1)
         return next_mem
 
-# class QuestionModule(nn.Module):
-#     def __init__(self, hidden_size):
-#         super(QuestionModule, self).__init__()
-#         self.gru = nn.GRU(hidden_size, hidden_size, batch_first=True)
-#
-#     def forward(self, questions):
-#         '''
-#         questions.size() -> (#batch, #sentence, #embedding)
-#         gru() -> (1, #batch, #hidden)
-#         '''
-#         _, questions = self.gru(questions)
-#         questions = questions.transpose(0, 1)
-#         return questions
+class QuestionModule(nn.Module):
+    def __init__(self, hidden_size):
+        super(QuestionModule, self).__init__()
+        self.gru = nn.GRU(hidden_size, hidden_size, batch_first=True)
+
+    def forward(self, questions):
+        '''
+        questions.size() -> (#batch, #sentence, #embedding)
+        gru() -> (1, #batch, #hidden)
+        '''
+        _, questions = self.gru(questions)
+        questions = questions.transpose(0, 1)
+        return questions
 
 class InputModule(nn.Module):
-    def __init__(self, hidden_size):
+    def __init__(self, hidden_size, enable_pruning=False):
         super(InputModule, self).__init__()
         self.hidden_size = hidden_size
         self.gru = nn.GRU(hidden_size, hidden_size, bidirectional=True, batch_first=True)
         for name, param in self.gru.state_dict().items():
             if 'weight' in name: init.xavier_normal(param)
         self.dropout = nn.Dropout(0.1)
-        infersent = torch.load(ENCODER_PATH).cuda()
-        self.entailment = infersent.classifier
+        self.enable_pruning = enable_pruning
+        if self.enable_pruning:
+            infersent = torch.load(ENCODER_PATH).cuda()
+            self.entailment = infersent.classifier
 
     def prune_contexts(self, contexts, question):
         """
@@ -229,44 +236,58 @@ class InputModule(nn.Module):
                     contexts[i].index_select(0, contextualized_sentence_ids[i])
         return padded_contextualized_pruned_contexts
 
-    def forward(self, contexts, question):
+    def forward(self, contexts, question=None):
         '''
         contexts.size() -> (#batch, #context, #embedding)
         # question.size() -> (#batch, #embedding)
         facts.size() -> (#batch, #context, #hidden)
         '''
-        contexts = self.prune_contexts(contexts, question)
+        if self.enable_pruning:
+            contexts = self.prune_contexts(contexts, question)
         contexts = self.dropout(contexts)
         facts, hdn = self.gru(contexts)
         facts = facts[:, :, :self.hidden_size] + facts[:, :, self.hidden_size:]
         return facts
 
-# class AnswerModule(nn.Module):
-#     def __init__(self, hidden_size):
-#         super(AnswerModule, self).__init__()
-#         # self.z = nn.Linear(2 * hidden_size, 2)
-#         # init.xavier_normal(self.z.state_dict()['weight'])
-#         # self.dropout = nn.Dropout(0.1)
-#
-#     def forward(self, memory, question):
-#         memory = self.dropout(memory)
-#         concat = torch.cat([memory, question], dim=2).squeeze(1)
-#         # z = self.z(concat)
-#         return concat
+class AnswerModule(nn.Module):
+    def __init__(self, hidden_size):
+        super(AnswerModule, self).__init__()
+        self.z = nn.Linear(2 * hidden_size, 2)
+        init.xavier_normal(self.z.state_dict()['weight'])
+        self.dropout = nn.Dropout(0.1)
+
+    def forward(self, memory, question):
+        memory = self.dropout(memory)
+        concat = torch.cat([memory, question], dim=2).squeeze(1)
+        z = self.z(concat)
+        return concat
 
 class DMNEncoder(nn.Module):
-    def __init__(self, hidden_size, num_hop):
+    def __init__(self, hidden_size, num_hop, isEncoder=False):
         super(DMNEncoder, self).__init__()
-        self.input_module = InputModule(hidden_size)
-        self.memory = EpisodicMemory(hidden_size)
         self.num_hop = num_hop
+        self.memory = EpisodicMemory(hidden_size)
+        self.isEncoder = isEncoder
+        if self.isEncoder:
+            self.input_module = InputModule(hidden_size, enable_pruning=True)
+        else:
+            self.input_module = InputModule(hidden_size)
+            self.question_module = QuestionModule(hidden_size)
+            self.answer_module = AnswerModule(hidden_size)
 
     def forward(self, src, question):
-        facts = self.input_module(src, question)
+        if self.isEncoder:
+            facts = self.input_module(src, question)
+        else:
+            facts = self.input_module(src)
+            question = self.question_module(question)
         memory = question
         for hop in range(self.num_hop):
             memory = self.memory(facts, question, memory)
-        output = torch.cat([memory, question], dim=2).squeeze(1)
+        if self.isEncoder:
+            output = torch.cat([memory, question], dim=2).squeeze(1)
+        else:
+            output = self.answer_module(memory, question)
         return output
 
 class CNNEncoder(nn.Module):
@@ -303,12 +324,16 @@ class CNNEncoder(nn.Module):
         return output
 
 class DMNPlus(nn.Module):
-    def __init__(self, hidden_size, num_hop=3):
+    def __init__(self, hidden_size, num_hop=3, isSentenceLevel=False):
         super(DMNPlus, self).__init__()
         self.num_hop = num_hop
         self.criterion = nn.CrossEntropyLoss(size_average=False)
-        self.mem_encoder = DMNEncoder(hidden_size, num_hop)
-        self.cnn_encoder = CNNEncoder(2 * hidden_size, num_filters=200, filter_sizes=[3, 4, 5])
+        self.isSentenceLevel = isSentenceLevel
+        if isSentenceLevel:
+            self.mem_encoder = DMNEncoder(hidden_size, num_hop, isEncoder=True)
+            self.cnn_encoder = CNNEncoder(2 * hidden_size, num_filters=200, filter_sizes=[3, 4, 5])
+        else:
+            self.mem_encoder = DMNEncoder(hidden_size, num_hop)
 
     def forward(self, src, tgt):
         '''
@@ -318,15 +343,18 @@ class DMNPlus(nn.Module):
         rdv.size() -> (#batch, #sentence, 2 * #embedding)
         output.size() -> (#batch, 2)
         '''
-        batch_num, sent_num, embedding_dim = tgt.size()
-        # rdv = Relative document vector
-        rdv = torch.zeros(batch_num, sent_num, 2 * embedding_dim).cuda()
-        for i in range(sent_num):
-            question = tgt.index_select(1, torch.tensor([i]).cuda())
-            encoding = checkpoint(self.mem_encoder, src, question)
-            for j in range(batch_num):
-                rdv[j][i] = encoding[j]
-        output = self.cnn_encoder(rdv)
+        if self.isSentenceLevel:
+            batch_num, sent_num, embedding_dim = tgt.size()
+            # rdv = Relative document vector
+            rdv = torch.zeros(batch_num, sent_num, 2 * embedding_dim).cuda()
+            for i in range(sent_num):
+                question = tgt.index_select(1, torch.tensor([i]).cuda())
+                encoding = checkpoint(self.mem_encoder, src, question)
+                for j in range(batch_num):
+                    rdv[j][i] = encoding[j]
+            output = self.cnn_encoder(rdv)
+        else:
+            output = self.mem_encoder(src, tgt)
         return output
 
     def get_loss(self, src, tgt, answers):
@@ -359,7 +387,7 @@ def step(dataloader, model, optim, train=True):
     all_preds = []
     for batch_idx, data in enumerate(dataloader):
         optim.zero_grad()
-        _, _, src, tgt, answers = data
+        src, tgt, answers = data[-3:] 
         batch_size = answers.shape[0]
         src = Variable(src.cuda())
         tgt = Variable(tgt.cuda())
@@ -392,7 +420,7 @@ if __name__ == "__main__":
     # Training and validation starts here
     for fold_num in range(NUM_FOLDS):
         # define the model
-        model = DMNPlus(hidden_size, num_hop=NUM_HOPS)
+        model = DMNPlus(hidden_size, num_hop=NUM_HOPS, isSentenceLevel=IS_SENTENCE_LEVEL)
         model.cuda()
         if PRE_TRAINED_MODEL:
             with open(PRE_TRAINED_MODEL, 'rb') as fp:
