@@ -6,6 +6,7 @@ Command: python dmn.py <dataset_name>
 # Config variables
 import os
 import sys
+import gc
 
 NUM_FOLDS = 1
 NUM_HOPS = 4
@@ -14,7 +15,7 @@ BATCH_SIZE = 32
 EARLY_STOP_THRESHOLD = 10
 PRE_TRAINED_MODEL = None
 EPOCH_OFFSET = 1
-GPU_ID = 2
+GPU_ID = 0
 DATASET_NAME = sys.argv[1]
 if DATASET_NAME == 'DLND':
     LOGFILE = 'dlnd/dlnd_logs'
@@ -408,19 +409,53 @@ def step(dataloader, model, optim, train=True):
         LOG.debug(f'Loss : {total_loss / cnt: {5}.{4}}, acc: {total_acc / cnt: {5}.{4}}, batch_idx: {batch_idx}')
     return total_acc / cnt, all_preds
 
-if __name__ == "__main__":
-    # Initialise data
-    dset = DmnData(DATASET_NAME, folds=NUM_FOLDS)
-    collate_func = partial(pad_collate, vocab=dset.vocab)
-    # Model parameters
-    # hidden_size = sentence embedding dimension
-    hidden_size = dset.hidden
+
+def pretty_size(size):
+    """Pretty prints a torch.Size object"""
+    assert isinstance(size, torch.Size)
+    return " x ".join(map(str, size))
+
+
+def dump_tensors(gpu_only=True):
+    """Prints a list of the Tensors being tracked by the garbage collector."""
+    import gc
+    total_size = 0
+    for obj in gc.get_objects():
+        try:
+            if torch.is_tensor(obj):
+                if not gpu_only or obj.is_cuda:
+                    print("%s:%s%s %s" % (type(obj).__name__,
+                                          " GPU" if obj.is_cuda else "",
+                                          " pinned" if obj.is_pinned else "",
+                                          pretty_size(obj.size())))
+                    total_size += obj.numel()
+            elif hasattr(obj, "data") and torch.is_tensor(obj.data):
+                if not gpu_only or obj.is_cuda:
+                    print("%s -> %s:%s%s%s%s %s" % (type(obj).__name__,
+                                                    type(obj.data).__name__,
+                                                    " GPU" if obj.is_cuda else "",
+                                                    " pinned" if obj.data.is_pinned else "",
+                                                    " grad" if obj.requires_grad else "",
+                                                    " volatile" if obj.volatile else "",
+                                                    pretty_size(obj.data.size())))
+                    total_size += obj.data.numel()
+        except:
+            pass
+        print("Total size:", total_size)
+
+
+def print_memory_stats():
+    print('GPU memory usage: %f' % torch.cuda.memory_allocated())
+    print('Caching allocator memory usage: %f' % torch.cuda.memory_cached())
+
+
+def perform_folds(dset, collate_func):
     # collect acuracy across all the folds
     all_folds_acc = 0
     # Training and validation starts here
     for fold_num in range(NUM_FOLDS):
         # define the model
-        model = DMNPlus(hidden_size, num_hop=NUM_HOPS, isSentenceLevel=IS_SENTENCE_LEVEL)
+        model = DMNPlus(dset.hidden, num_hop=NUM_HOPS, isSentenceLevel=IS_SENTENCE_LEVEL)
         model.cuda()
         if PRE_TRAINED_MODEL:
             with open(PRE_TRAINED_MODEL, 'rb') as fp:
@@ -474,11 +509,32 @@ if __name__ == "__main__":
         LOG.debug(f'Testing Accuracy : {test_acc: {5}.{4}}')
         # Save the best model
         os.makedirs(os.path.join(DATASET_NAME.lower(), 'models'), exist_ok=True)
-        test_filename = f'fold{fold_num+1}_test_acc{test_acc:{5}.{4}}'
+        test_filename = f'topic_{topic}_fold{fold_num+1}_test_acc{test_acc:{5}.{4}}'
         with open(f'{DATASET_NAME.lower()}/models/{test_filename}.pth', 'wb') as fp:
             torch.save(best_state, fp)
         # Save the predictions
         os.makedirs(os.path.join(DATASET_NAME.lower(), 'predictions'), exist_ok=True)
         # test_preds is an array containing the predictions for the test data for the current fold
         pickle.dump([test_preds], open(f'{DATASET_NAME.lower()}/predictions/{test_filename}.p', "wb"))
+        # delete model to free GPU memory
+        del model
+        del optim
     LOG.debug('Overall test accuracy over %d folds: %5.4f', NUM_FOLDS, all_folds_acc/NUM_FOLDS)
+
+if __name__ == "__main__":
+    # Initialise data
+    dset = DmnData(DATASET_NAME, folds=NUM_FOLDS)
+    collate_func = partial(pad_collate, vocab=dset.vocab)
+    # Iterate through all available topics
+    for topic in dset.topics:
+        # Delete unused tensors from the cache
+        torch.cuda.empty_cache()
+        # Clear the garbage collector
+        gc.collect()
+        # Print the size of the objects being tracked by the garbage collector
+        # This was added to investigate CUDA OOM errors.
+        #dump_tensors()
+        #print_memory_stats()
+        # Perform folds
+        dset.select_topic(topic)
+        perform_folds(dset, collate_func)

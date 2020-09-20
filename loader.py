@@ -34,13 +34,13 @@ def oversample(data, minority_class):
         data[item_no] += [data[item_no][idx] for idx in random_ids]
     return data
 
-def split_stratify_data(data):
+def split_stratify_data(data, train_ratio):
     """
-    Split data into train and test as 90% and 10% respectively
+    Split data into train and test data
     """
     answers = data[-1]
     splitting = train_test_split(*data,
-                                 test_size=0.1,
+                                 train_size=train_ratio,
                                  random_state=RANDOM_SEED,
                                  shuffle=True,
                                  stratify=answers)
@@ -60,7 +60,7 @@ def get_dlnd_data():
             = pickle.load(open(DLND_DATA, 'rb'), encoding='latin1')
     # random oversampling of minority class (novel class: 1)
     data = [src_docs, tgt_docs, src_ids, tgt_ids, golds]
-    return oversample(data, 1), vocab
+    return oversample(data, 1), vocab, ['']
 
 
 def get_apwsj_data():
@@ -102,7 +102,7 @@ def get_apwsj_data():
         del golds[idx]
     # random oversampling of minority class (non-novel class: 0)
     data = [context_docs, docs, contexts, questions, golds]
-    return oversample(data, 0), vocab
+    return oversample(data, 0), vocab, ['']
 
 def get_ste_data():
     """
@@ -110,18 +110,32 @@ def get_ste_data():
     """
     # data = [subtopics, tgt_ids, src_ids, vocab, golds]
     subtopics, tgt_ids, src_ids, vocab, golds = pickle.load(open(STE_DATA, 'rb'), encoding='latin1')
+    # Remove blacklisted topics
+    blacklisted_topics = blacklisted_topics = open(
+        '/home1/tirthankar/Vignesh/dmn/code/ste/stack_exchange_data/corpus/blacklist.txt', 'r'
+    ).read().splitlines()
+    remove_ids = [idx
+                  for idx, subtopic in enumerate(subtopics)
+                  if subtopic.split('/')[0] in blacklisted_topics]
+    for idx in remove_ids[::-1]:
+        del subtopics[idx]
+        del tgt_ids[idx]
+        del src_ids[idx]
+        del golds[idx]
     data = [subtopics, src_ids, tgt_ids, golds]
+    topics = list(set(subtopic.split('/')[0] for subtopic in data[0]))
+    # put special_topic as the first topic
+    # special_topic = 'matheducators'
+    # topics = [special_topic] + [topic for topic in topics if topic != special_topic]
     # random oversample of minority class (non-novel class: 0)
-    return oversample(data, 0), vocab
+    return oversample(data, 0), vocab, topics
 
-def split_data(data):
+def split_data(data, train_ratio):
     """
     Split data into training, validation and testing data
     """
-    # Train, Test split is 90%, 10% respectively
-    train_data, test_data = split_stratify_data(data)
-    # Valid data is 10% of Train data
-    train_data, valid_data = split_stratify_data(train_data)
+    train_data, test_data = split_stratify_data(data, train_ratio)
+    train_data, valid_data = split_stratify_data(train_data, train_ratio)
     return train_data, valid_data, test_data
 
 def pad_collate(batch, vocab):
@@ -189,32 +203,61 @@ class DmnData(Dataset):
     """
     def __init__(self, dataset_name, mode='train', folds=1):
         self.mode = mode
+        self.dataset_name = dataset_name
+        self.num_folds = folds
         if dataset_name == 'DLND':
-            self.data, self.vocab = get_dlnd_data()
+            self.data, self.vocab, self.topics = get_dlnd_data()
         elif dataset_name == 'APWSJ':
-            self.data, self.vocab = get_apwsj_data()
+            self.data, self.vocab, self.topics = get_apwsj_data()
         elif dataset_name == 'STE':
-            self.data, self.vocab = get_ste_data()
+            self.data, self.vocab, self.topics = get_ste_data()
+            # Deep copy self.data into self.all_data
+            self.all_data = list()
+            for data_item in self.data:
+                self.all_data.append(data_item[:])
         else:
             raise Exception('Dataset name %s is not supported!' % dataset_name)
         # Set self.hidden = embedding size = self.vocab.shape[1]
         self.hidden = self.vocab.shape[1]
-        if folds <= 1:
-            # Set splitting type
-            self.split_type = 'ninety-ten'
-            self.train, self.valid, self.test = split_data(self.data)
-            LOG.debug('Will do ninety ten split')
+        self.init_train_valid_test_data()
+
+    def select_topic(self, topic):
+        """
+        Filter out topic other than the provided from self.data
+        and split self.data again
+        """
+        if (not topic) or (topic not in self.topics):
+            LOG.error("Invalid topic '%s', will not do anything!", topic)
+            return
+        LOG.debug('Selecting topic: %s', topic)
+        ids = [idx
+               for idx, subtopic in enumerate(self.all_data[0])
+               if subtopic.split('/')[0] == topic]
+        for data_no, data_item in enumerate(self.all_data):
+            self.data[data_no] = [data_item[idx] for idx in ids]
+        self.init_train_valid_test_data()
+
+
+    def init_train_valid_test_data(self):
+        """
+        Initialize self.{train,valid,test} by splitting self.data
+        """
+        if self.num_folds <= 1:
+            if self.dataset_name == 'STE':
+                train_ratio = 0.8
+            else:
+                train_ratio = 0.9
+            self.train, self.valid, self.test = split_data(self.data, train_ratio)
+            LOG.debug('Train ratio: %f', train_ratio)
         else:
-            # Set splitting type
-            self.split_type = 'kfold'
             # golds = data[-1]
             skf = StratifiedKFold(
-                n_splits=folds,
+                n_splits=self.num_folds,
                 random_state=RANDOM_SEED,
                 shuffle=True)
             self.folds = skf.split(np.zeros(len(self.data[0])), self.data[-1])
             self.next_fold()
-            LOG.debug('Will do %d fold cross validation', folds)
+            LOG.debug('Will do %d fold cross validation', self.num_folds)
         # Log data set size details
         LOG.debug('Sentence Embedding dimension: %d', self.hidden)
         LOG.debug('Total data size: %d', len(self.data[0]))
@@ -233,7 +276,7 @@ class DmnData(Dataset):
         """
         Sets self.{train|valid|test} from the next fold
         """
-        if not self.split_type == 'kfold':
+        if self.num_folds <= 1:
             LOG.error('KFold splitting is not enabled')
             return
         try:
