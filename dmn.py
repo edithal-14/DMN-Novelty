@@ -189,7 +189,7 @@ class InputModule(nn.Module):
         self.dropout = nn.Dropout(0.1)
         self.enable_pruning = enable_pruning
         if self.enable_pruning:
-            infersent = torch.load(ENCODER_PATH).cuda()
+            infersent = torch.load(ENCODER_PATH, map_location=torch.device('cuda')).cuda()
             self.entailment = infersent.classifier
 
     def prune_contexts(self, contexts, question):
