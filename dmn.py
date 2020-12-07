@@ -15,7 +15,7 @@ BATCH_SIZE = 32
 EARLY_STOP_THRESHOLD = 10
 PRE_TRAINED_MODEL = None
 EPOCH_OFFSET = 1
-GPU_ID = 0
+GPU_ID = 6
 DATASET_NAME = sys.argv[1]
 if DATASET_NAME == 'DLND':
     LOGFILE = 'dlnd/dlnd_logs'
@@ -35,6 +35,7 @@ ENCODER_PATH = os.path.join(ENCODER_DIR, "models/model_2048_attn.pickle")
 sys.path.append(ENCODER_DIR)
 
 import logging
+import numpy as np
 import pickle
 import torch
 torch.cuda.set_device(GPU_ID)
@@ -113,6 +114,8 @@ class AttentionGRU(nn.Module):
 class EpisodicMemory(nn.Module):
     def __init__(self, hidden_size):
         super(EpisodicMemory, self).__init__()
+        # Store attention values for each hop
+        self.att_vals = list()
         self.AGRU = AttentionGRU(hidden_size, hidden_size)
         self.z1 = nn.Linear(4 * hidden_size, hidden_size)
         self.z2 = nn.Linear(hidden_size, 1)
@@ -120,6 +123,13 @@ class EpisodicMemory(nn.Module):
         init.xavier_normal(self.z1.state_dict()['weight'])
         init.xavier_normal(self.z2.state_dict()['weight'])
         init.xavier_normal(self.next_mem.state_dict()['weight'])
+
+    def clear_stored_att_vals(self):
+        '''
+        Clear the attention values stored in att_vals before the start
+        of the episodic memory module
+        '''
+        self.att_vals = list()
 
     def make_interaction(self, facts, question, prevM):
         '''
@@ -159,6 +169,8 @@ class EpisodicMemory(nn.Module):
         concat.size() -> (#batch, 3 x #embedding)
         '''
         G = self.make_interaction(facts, question, prevM)
+        # Store attention values for each hop
+        self.att_vals.append(G)
         C = self.AGRU(facts, G)
         concat = torch.cat([prevM.squeeze(1), C, question.squeeze(1)], dim=1)
         next_mem = F.relu(self.next_mem(concat))
@@ -260,8 +272,7 @@ class AnswerModule(nn.Module):
     def forward(self, memory, question):
         memory = self.dropout(memory)
         concat = torch.cat([memory, question], dim=2).squeeze(1)
-        z = self.z(concat)
-        return concat
+        return self.z(concat)
 
 class DMNEncoder(nn.Module):
     def __init__(self, hidden_size, num_hop, isEncoder=False):
@@ -283,12 +294,19 @@ class DMNEncoder(nn.Module):
             facts = self.input_module(src)
             question = self.question_module(question)
         memory = question
+        # Before the start of a Episodic Memory step, clear the stored attention values
+        self.memory.clear_stored_att_vals()
         for hop in range(self.num_hop):
             memory = self.memory(facts, question, memory)
         if self.isEncoder:
             output = torch.cat([memory, question], dim=2).squeeze(1)
         else:
             output = self.answer_module(memory, question)
+        attention_values = np.vstack(
+            [att_val.detach().cpu().numpy()
+             for att_val in self.memory.att_vals])
+        # print('Attention values:')
+        # print(attention_values)
         return output
 
 class CNNEncoder(nn.Module):
@@ -333,6 +351,8 @@ class DMNPlus(nn.Module):
         if isSentenceLevel:
             self.mem_encoder = DMNEncoder(hidden_size, num_hop, isEncoder=True)
             self.cnn_encoder = CNNEncoder(2 * hidden_size, num_filters=200, filter_sizes=[3, 4, 5])
+            # For documents with less than 5 target sentences use filter of size 1
+            # self.cnn_encoder = CNNEncoder(2 * hidden_size, num_filters=200, filter_sizes=[1])
         else:
             self.mem_encoder = DMNEncoder(hidden_size, num_hop)
 

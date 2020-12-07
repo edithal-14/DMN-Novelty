@@ -16,7 +16,7 @@ import pickle
 import sys
 
 # Path Variables
-GPU_ID = 2
+GPU_ID = 1
 HOME_DIR = "/home1/tirthankar"
 STE_PATH = os.path.join(HOME_DIR, 'Vignesh/dmn/code/ste/stack_exchange_data/corpus')
 GLOVE_PATH = os.path.join(HOME_DIR, 'glove.840B.300d.txt')
