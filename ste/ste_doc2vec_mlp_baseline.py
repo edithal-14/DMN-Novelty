@@ -2,7 +2,7 @@
 from collections import defaultdict
 import csv
 import os
-os.environ["CUDA_VISIBLE_DEVICES"] = "3"
+os.environ["CUDA_VISIBLE_DEVICES"] = "4"
 os.environ['TF_CPP_MIN_LOG_LEVEL'] = '3'
 import sys
 import tensorflow as tf
@@ -25,7 +25,13 @@ from spacy_decomposable_attention import _Entailment
 from keras.optimizers import Adam
 from keras.utils.np_utils import to_categorical
 from keras.models import Model
-from keras.layers import Input,Flatten,Bidirectional, GRU, LSTM
+from keras.layers import (
+    Bidirectional,
+    Flatten,
+    Input,
+    LSTM,
+    GRU
+)
 from keras import backend as K
 from gensim.models.doc2vec import Doc2Vec
 from nltk.corpus import stopwords
@@ -112,14 +118,17 @@ def init_logger(logger, filename):
     logger.setLevel(logging.DEBUG)
 
 def process_topic():
-    LOG.debug('Processing topic: %s', topic)
-    ids = [idx for idx in range(len(subtopics)) if subtopics[idx].split('/')[0] == topic]
+#     LOG.debug('Processing topic: %s', topic)
+#     ids = [idx for idx in range(len(subtopics)) if subtopics[idx].split('/')[0] == topic]
     max_sents = max([len(doc) for doc in source_sentences + target_sentences])
     LOG.debug("Max sentences: %d", max_sents)
 
-    target_vecs = doc_to_mat([target_sentences[idx] for idx in ids], max_sents)
-    source_vecs = doc_to_mat([source_sentences[idx] for idx in ids], max_sents)
-    golds = [all_golds[idx] for idx in ids]
+#     target_vecs = doc_to_mat([target_sentences[idx] for idx in ids], max_sents)
+#     source_vecs = doc_to_mat([source_sentences[idx] for idx in ids], max_sents)
+#     golds = [all_golds[idx] for idx in ids]
+    target_vecs = doc_to_mat(target_sentences, max_sents)
+    source_vecs = doc_to_mat(source_sentences, max_sents)
+    golds = all_golds
     gold_list = [i for i in golds]
     golds = to_categorical(golds)
 
@@ -156,8 +165,8 @@ def process_topic():
     LOG.debug("Confusion matrix:\n%s\n\n", confusion_matrix(gold_test,preds))
 
     # Write completed topic
-    with open(completed_topics_file, 'a') as fh:
-        fh.write('\n{}'.format(topic))
+    # with open(completed_topics_file, 'a') as fh:
+    #     fh.write('\n{}'.format(topic))
 
     # Cleanup memory
     del model
@@ -206,12 +215,12 @@ else:
 subtopics, source_sentences, target_sentences, all_golds = oversample(
     [subtopics, source_sentences, target_sentences, all_golds], 0)
 
-unique_topics = set([subtopic.split('/')[0] for subtopic in subtopics])
-completed_topics_file = 'ste_doc2vec_mlp_baseline_completed_topics.txt'
-with open(completed_topics_file, 'r') as fh:
-    completed_topics = fh.read().splitlines()
+# unique_topics = set([subtopic.split('/')[0] for subtopic in subtopics])
+# completed_topics_file = 'ste_doc2vec_mlp_baseline_completed_topics.txt'
+# with open(completed_topics_file, 'r') as fh:
+#     completed_topics = fh.read().splitlines()
 
-for topic in unique_topics:
-    if topic in completed_topics:
-        continue
-    process_topic()
+# for topic in unique_topics:
+#     if topic in completed_topics:
+#         continue
+process_topic()

@@ -8,14 +8,14 @@ import os
 import sys
 import gc
 
-NUM_FOLDS = 1
+NUM_FOLDS = 5
 NUM_HOPS = 4
 NUM_EPOCHS = 25
 BATCH_SIZE = 32
 EARLY_STOP_THRESHOLD = 10
 PRE_TRAINED_MODEL = None
 EPOCH_OFFSET = 1
-GPU_ID = 6
+GPU_ID = 4
 DATASET_NAME = sys.argv[1]
 if DATASET_NAME == 'DLND':
     LOGFILE = 'dlnd/dlnd_logs'
@@ -529,7 +529,7 @@ def perform_folds(dset, collate_func):
         LOG.debug(f'Testing Accuracy : {test_acc: {5}.{4}}')
         # Save the best model
         os.makedirs(os.path.join(DATASET_NAME.lower(), 'models'), exist_ok=True)
-        test_filename = f'topic_{topic}_fold{fold_num+1}_test_acc{test_acc:{5}.{4}}'
+        test_filename = f'fold{fold_num+1}_test_acc{test_acc:{5}.{4}}'
         with open(f'{DATASET_NAME.lower()}/models/{test_filename}.pth', 'wb') as fp:
             torch.save(best_state, fp)
         # Save the predictions
@@ -545,16 +545,5 @@ if __name__ == "__main__":
     # Initialise data
     dset = DmnData(DATASET_NAME, folds=NUM_FOLDS)
     collate_func = partial(pad_collate, vocab=dset.vocab)
-    # Iterate through all available topics
-    for topic in dset.topics:
-        # Delete unused tensors from the cache
-        torch.cuda.empty_cache()
-        # Clear the garbage collector
-        gc.collect()
-        # Print the size of the objects being tracked by the garbage collector
-        # This was added to investigate CUDA OOM errors.
-        #dump_tensors()
-        #print_memory_stats()
-        # Perform folds
-        dset.select_topic(topic)
-        perform_folds(dset, collate_func)
+    # Perform folds
+    perform_folds(dset, collate_func)

@@ -7,6 +7,7 @@ creating a model.
 Run this script with python3 and pytorch 0.3 with GPU support
 """
 
+import csv
 from itertools import tee
 from nltk import sent_tokenize, word_tokenize
 import numpy as np

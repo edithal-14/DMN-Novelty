@@ -124,9 +124,6 @@ def get_ste_data():
         del golds[idx]
     data = [subtopics, src_ids, tgt_ids, golds]
     topics = list(set(subtopic.split('/')[0] for subtopic in data[0]))
-    # put special_topic as the first topic
-    # special_topic = 'matheducators'
-    # topics = [special_topic] + [topic for topic in topics if topic != special_topic]
     # random oversample of minority class (non-novel class: 0)
     return oversample(data, 0), vocab, topics
 
