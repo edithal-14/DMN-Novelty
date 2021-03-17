@@ -1,6 +1,8 @@
 """
 Run DMN model
 Command: python dmn.py <dataset_name>
+
+Usage notes: Run in python3 in conda environment named vignesh
 """
 
 # Config variables
@@ -10,13 +12,14 @@ import gc
 
 NUM_FOLDS = 5
 NUM_HOPS = 4
-NUM_EPOCHS = 25
-BATCH_SIZE = 32
-EARLY_STOP_THRESHOLD = 10
+NUM_EPOCHS = 10
+BATCH_SIZE = 16
+EARLY_STOP_THRESHOLD = 4
 PRE_TRAINED_MODEL = None
 EPOCH_OFFSET = 1
-GPU_ID = 4
+GPU_ID = 0
 DATASET_NAME = sys.argv[1]
+IS_REGRESSION = False
 if DATASET_NAME == 'DLND':
     LOGFILE = 'dlnd/dlnd_logs'
     IS_SENTENCE_LEVEL = True
@@ -26,6 +29,13 @@ elif DATASET_NAME == 'APWSJ':
 elif DATASET_NAME == 'STE':
     LOGFILE = 'ste/ste_logs'
     IS_SENTENCE_LEVEL = False
+elif DATASET_NAME == 'WEBIS':
+    LOGFILE = 'webis/webis_logs'
+    IS_SENTENCE_LEVEL = True
+elif DATASET_NAME == 'DLND2':
+    LOGFILE = 'dlnd2/dlnd2_logs'
+    IS_SENTENCE_LEVEL = False
+    IS_REGRESSION = True
 else:
     raise Exception('Dataset name %s is not supported!' % DATASET_NAME)
 HOME_DIR = "/home1/tirthankar"
@@ -37,6 +47,9 @@ sys.path.append(ENCODER_DIR)
 import logging
 import numpy as np
 import pickle
+from scipy.spatial import distance
+from scipy.stats import pearsonr
+from sklearn.metrics import mean_absolute_error, mean_squared_error
 import torch
 torch.cuda.set_device(GPU_ID)
 import torch.nn as nn
@@ -263,9 +276,9 @@ class InputModule(nn.Module):
         return facts
 
 class AnswerModule(nn.Module):
-    def __init__(self, hidden_size):
+    def __init__(self, hidden_size, output_dim=2):
         super(AnswerModule, self).__init__()
-        self.z = nn.Linear(2 * hidden_size, 2)
+        self.z = nn.Linear(2 * hidden_size, output_dim)
         init.xavier_normal(self.z.state_dict()['weight'])
         self.dropout = nn.Dropout(0.1)
 
@@ -275,7 +288,7 @@ class AnswerModule(nn.Module):
         return self.z(concat)
 
 class DMNEncoder(nn.Module):
-    def __init__(self, hidden_size, num_hop, isEncoder=False):
+    def __init__(self, hidden_size, num_hop, isEncoder=False, non_encoder_output_dim=2):
         super(DMNEncoder, self).__init__()
         self.num_hop = num_hop
         self.memory = EpisodicMemory(hidden_size)
@@ -285,7 +298,7 @@ class DMNEncoder(nn.Module):
         else:
             self.input_module = InputModule(hidden_size)
             self.question_module = QuestionModule(hidden_size)
-            self.answer_module = AnswerModule(hidden_size)
+            self.answer_module = AnswerModule(hidden_size, output_dim=non_encoder_output_dim)
 
     def forward(self, src, question):
         if self.isEncoder:
@@ -313,12 +326,12 @@ class CNNEncoder(nn.Module):
     """
     Apply convolution + max pool
     """
-    def __init__(self, hidden_size, num_filters, filter_sizes):
+    def __init__(self, hidden_size, num_filters, filter_sizes, output_dim=2):
         super(CNNEncoder, self).__init__()
         self.convs = nn.ModuleList()
         for filter_size in filter_sizes:
             self.convs.append(nn.Conv2d(1, num_filters, (filter_size, hidden_size)))
-        self.fc = nn.Linear(len(filter_sizes) * num_filters, 2)
+        self.fc = nn.Linear(len(filter_sizes) * num_filters, output_dim)
         init.xavier_normal(self.fc.state_dict()['weight'])
         self.dropout = nn.Dropout(0.1)
 
@@ -343,18 +356,26 @@ class CNNEncoder(nn.Module):
         return output
 
 class DMNPlus(nn.Module):
-    def __init__(self, hidden_size, num_hop=3, isSentenceLevel=False):
+    def __init__(self, hidden_size, num_hop=3, isSentenceLevel=False, isRegression=False):
         super(DMNPlus, self).__init__()
         self.num_hop = num_hop
-        self.criterion = nn.CrossEntropyLoss(size_average=False)
         self.isSentenceLevel = isSentenceLevel
+        self.isRegression = isRegression
+        if isRegression:
+            output_dim = 1
+        else:
+            output_dim = 2
         if isSentenceLevel:
-            self.mem_encoder = DMNEncoder(hidden_size, num_hop, isEncoder=True)
-            self.cnn_encoder = CNNEncoder(2 * hidden_size, num_filters=200, filter_sizes=[3, 4, 5])
+            self.mem_encoder = DMNEncoder(hidden_size, num_hop, isEncoder=True, non_encoder_output_dim=output_dim)
+            self.cnn_encoder = CNNEncoder(2 * hidden_size, num_filters=200, filter_sizes=[3, 4, 5], output_dim=output_dim)
             # For documents with less than 5 target sentences use filter of size 1
             # self.cnn_encoder = CNNEncoder(2 * hidden_size, num_filters=200, filter_sizes=[1])
         else:
-            self.mem_encoder = DMNEncoder(hidden_size, num_hop)
+            self.mem_encoder = DMNEncoder(hidden_size, num_hop, non_encoder_output_dim=output_dim)
+        if isRegression:
+            self.criterion = nn.L1Loss(size_average=False)
+        else:
+            self.criterion = nn.CrossEntropyLoss(size_average=False)
 
     def forward(self, src, tgt):
         '''
@@ -380,15 +401,31 @@ class DMNPlus(nn.Module):
 
     def get_loss(self, src, tgt, answers):
         output = self.forward(src, tgt)
-        loss = self.criterion(output, answers)
         reg_loss = 0
         for param in self.parameters():
             reg_loss += 0.001 * torch.sum(param * param)
-        preds = F.softmax(output)
-        _, pred_ids = torch.max(preds, dim=1)
-        corrects = (pred_ids.data == answers.data)
-        acc = torch.mean(corrects.float())
-        return loss + reg_loss, acc, pred_ids.data
+        if self.isRegression:
+            predictions = F.leaky_relu(output)
+            predictions = predictions.squeeze()
+            loss = self.criterion(predictions, answers)
+            answers_data = answers.detach().cpu().numpy()
+            predictions = predictions.detach().cpu().numpy()
+            mae = mean_absolute_error(answers_data, predictions)
+            mse = mean_squared_error(answers_data, predictions)
+            cos_sim = 1 - distance.cosine(answers_data, predictions)
+            pearson_r, _ = pearsonr(answers_data, predictions)
+            metrics = {'pearson_r': pearson_r, 'mae': mae, 'mse': mse, 'cos_sim': cos_sim}
+        else:
+            predictions = F.softmax(output)
+            loss = self.criterion(output, answers)
+            _, predictions = torch.max(predictions, dim=1)
+            answers_data = answers.detach().cpu().numpy()
+            predictions = predictions.detach().cpu().numpy()
+            corrects = (predictions == answers_data)
+            acc = torch.mean(corrects.float())
+            metrics = {'acc': acc}
+        output = output.detach().cpu().numpy()
+        return loss + reg_loss, metrics, predictions, output
 
 def step(dataloader, model, optim, train=True):
     """Runs single step on the dataset
@@ -400,34 +437,49 @@ def step(dataloader, model, optim, train=True):
     train:      Boolean indicating whether to optimize model or just calculate loss
 
     Returns:
-    float: accuracy of the model
+    result: dict containing performance metrics
+
+    Performance metrics:
+    Regression model: pearson_r, mae, mse, cos_sim
+    Classification model: acc
     """
-    total_acc = 0
+    if model.isRegression:
+        metrics = {'pearson_r': 0.0, 'mae': 0.0, 'mse': 0.0, 'cos_sim': 0.0}
+    else:
+        metrics = {'acc': 0.0}
     total_loss = 0
     cnt = 0
     all_preds = []
+    all_outputs = []
     for batch_idx, data in enumerate(dataloader):
         optim.zero_grad()
-        src, tgt, answers = data[-3:] 
+        src, tgt, answers = data[-3:]
         batch_size = answers.shape[0]
         src = Variable(src.cuda())
         tgt = Variable(tgt.cuda())
         answers = Variable(answers.cuda())
-        loss, acc, preds = model.get_loss(src, tgt, answers)
+        loss, step_metrics, preds, output = model.get_loss(src, tgt, answers)
         all_preds.extend(preds.tolist())
-        total_acc += acc * batch_size
+        all_outputs.append(output)
         total_loss += loss.data.item() * batch_size
         cnt += batch_size
+        for metric_type in step_metrics:
+            metrics[metric_type] += step_metrics[metric_type] * batch_size
         if train:
             loss.backward()
             if batch_idx % 80 == 0:
-                LOG.debug(f'Training loss : {total_loss / cnt: {5}.{4}}, acc: {total_acc / cnt: {5}.{4}}, batch_idx: {batch_idx}')
+                perf_str = ', '.join([f'{metric_type}: {metrics[metric_type] / cnt: {5}.{4}}' for metric_type in metrics])
+                LOG.debug(f'Training loss : {total_loss / cnt: {5}.{4}}, {perf_str}, batch_idx: {batch_idx}')
             optim.step()
+    for metric_type in metrics:
+        total_loss /= cnt
+        metrics[metric_type] /= cnt
+    perf_str = ', '.join([f'{metric_type}: {metrics[metric_type]: {5}.{4}}' for metric_type in metrics])
     if train:
-        LOG.debug(f'Training loss : {total_loss / cnt: {5}.{4}}, acc: {total_acc / cnt: {5}.{4}}, batch_idx: {batch_idx}')
+        LOG.debug(f'Training loss : {total_loss: {5}.{4}}, {perf_str}, batch_idx: {batch_idx}')
     else:
-        LOG.debug(f'Loss : {total_loss / cnt: {5}.{4}}, acc: {total_acc / cnt: {5}.{4}}, batch_idx: {batch_idx}')
-    return total_acc / cnt, all_preds
+        LOG.debug(f'Loss : {total_loss: {5}.{4}}, {perf_str}, batch_idx: {batch_idx}')
+    return metrics, all_preds, all_outputs
 
 
 def pretty_size(size):
@@ -469,77 +521,100 @@ def print_memory_stats():
     print('Caching allocator memory usage: %f' % torch.cuda.memory_cached())
 
 
+def run_fold(fold_num):
+    # define the model
+    model = DMNPlus(dset.hidden, num_hop=NUM_HOPS, isSentenceLevel=IS_SENTENCE_LEVEL, isRegression=IS_REGRESSION)
+    model.cuda()
+    if PRE_TRAINED_MODEL:
+        with open(PRE_TRAINED_MODEL, 'rb') as fp:
+            model.load_state_dict(torch.load(fp))
+    early_stopping_cnt = 0
+    early_stopping_flag = False
+    best_result = -float('inf')
+    optim = Adam(model.parameters())
+    lr_decay = ReduceLROnPlateau(optim, mode='max', patience=3,
+                                 threshold_mode='abs', threshold=0.01, verbose=True)
+    if fold_num > 0:
+        # Get the current fold of data to use
+        dset.next_fold()
+    LOG.debug('Fold no: %d', fold_num + 1)
+    # Training starts here
+    for epoch in range(EPOCH_OFFSET, NUM_EPOCHS+EPOCH_OFFSET):
+        # Training step
+        dset.set_mode('train')
+        train_loader = DataLoader(dset, batch_size=BATCH_SIZE, shuffle=True, collate_fn=collate_func)
+        model.train()
+        LOG.debug(f'Epoch {epoch}')
+        step(train_loader, model, optim, train=True)
+        # Validation step
+        dset.set_mode('valid')
+        valid_loader = DataLoader(dset, batch_size=BATCH_SIZE, shuffle=False, collate_fn=collate_func)
+        model.eval()
+        valid_metrics, _, _ = step(valid_loader, model, optim, train=False)
+        for metric_type in valid_metrics:
+            LOG.debug(f'Validation {metric_type}: {valid_metrics[metric_type]: {5}.{4}}')
+        # Decay Learning rate
+        if IS_REGRESSION:
+            # less mae is better
+            valid_result = -1 * valid_metrics['mae']
+            lr_decay.step(valid_result)
+        else:
+            valid_result = valid_metrics['acc']
+            lr_decay.step(valid_result)
+        # Save best model and stop early
+        if valid_result > best_result:
+            best_result = valid_result
+            best_state = model.state_dict()
+            early_stopping_cnt = 0
+            LOG.debug(f'Improvement in Epoch {epoch}')
+        else:
+            early_stopping_cnt += 1
+            if early_stopping_cnt >= EARLY_STOP_THRESHOLD:
+                early_stopping_flag = True
+        if early_stopping_flag:
+            LOG.debug(f'Early Stopping at Epoch {epoch}, no improvement in {EARLY_STOP_THRESHOLD} epochs')
+            break
+    # Testing starts here
+    dset.set_mode('test')
+    test_loader = DataLoader(dset, batch_size=BATCH_SIZE, shuffle=False, collate_fn=collate_func)
+    # Load the best performing model
+    model.load_state_dict(best_state)
+    model.eval()
+    test_metrics, test_preds, _  = step(test_loader, model, optim, train=False)
+    for metric_type in test_metrics:
+        LOG.debug(f'Testing {metric_type}: {test_metrics[metric_type]: {5}.{4}}')
+    # Save the best model
+    os.makedirs(os.path.join(DATASET_NAME.lower(), 'models'), exist_ok=True)
+    if IS_REGRESSION:
+        test_result = test_metrics['mae']
+    else:
+        test_result = test_metrics['acc']
+    test_filename = f'fold{fold_num+1}_test_result{test_result:{5}.{4}}'
+    with open(f'{DATASET_NAME.lower()}/models/{test_filename}.pth', 'wb') as fp:
+        torch.save(best_state, fp)
+    # Save the predictions
+    os.makedirs(os.path.join(DATASET_NAME.lower(), 'predictions'), exist_ok=True)
+    # test_preds is an array containing the predictions for the test data for the current fold
+    pickle.dump([test_preds], open(f'{DATASET_NAME.lower()}/predictions/{test_filename}.p', "wb"))
+    # delete model to free GPU memory
+    del model
+    del optim
+    return test_metrics
+
+
 def perform_folds(dset, collate_func):
     # collect acuracy across all the folds
-    all_folds_acc = 0
+    if IS_REGRESSION:
+        all_folds_metrics = {'pearson_r': 0.0, 'mae': 0.0, 'mse': 0.0, 'cos_sim': 0.0}
+    else:
+        all_folds_metrics = {'acc': 0.0}
     # Training and validation starts here
     for fold_num in range(NUM_FOLDS):
-        # define the model
-        model = DMNPlus(dset.hidden, num_hop=NUM_HOPS, isSentenceLevel=IS_SENTENCE_LEVEL)
-        model.cuda()
-        if PRE_TRAINED_MODEL:
-            with open(PRE_TRAINED_MODEL, 'rb') as fp:
-                model.load_state_dict(torch.load(fp))
-        early_stopping_cnt = 0
-        early_stopping_flag = False
-        best_acc = 0
-        optim = Adam(model.parameters())
-        lr_decay = ReduceLROnPlateau(optim, mode='max', patience=3,
-                                     threshold_mode='abs', threshold=0.01, verbose=True)
-        if fold_num > 0:
-            # Get the current fold of data to use
-            dset.next_fold()
-        LOG.debug('Fold no: %d', fold_num + 1)
-        # Training starts here
-        for epoch in range(EPOCH_OFFSET, NUM_EPOCHS+EPOCH_OFFSET):
-            # Training step
-            dset.set_mode('train')
-            train_loader = DataLoader(dset, batch_size=BATCH_SIZE, shuffle=True, collate_fn=collate_func)
-            model.train()
-            LOG.debug(f'Epoch {epoch}')
-            step(train_loader, model, optim, train=True)
-            # Validation step
-            dset.set_mode('valid')
-            valid_loader = DataLoader(dset, batch_size=BATCH_SIZE, shuffle=False, collate_fn=collate_func)
-            model.eval()
-            acc, _ = step(valid_loader, model, optim, train=False)
-            LOG.debug(f'Validation Accuracy : {acc: {5}.{4}}')
-            # Decay Learning rate
-            lr_decay.step(acc)
-            # Save best model and stop early
-            if acc > best_acc:
-                best_acc = acc
-                best_state = model.state_dict()
-                early_stopping_cnt = 0
-            else:
-                early_stopping_cnt += 1
-                if early_stopping_cnt >= EARLY_STOP_THRESHOLD:
-                    early_stopping_flag = True
-            if early_stopping_flag:
-                LOG.debug(f'Early Stopping at Epoch {epoch}, no improvement in {EARLY_STOP_THRESHOLD} epochs')
-                break
-        # Testing starts here
-        dset.set_mode('test')
-        test_loader = DataLoader(dset, batch_size=BATCH_SIZE, shuffle=False, collate_fn=collate_func)
-        # Load the best performing model
-        model.load_state_dict(best_state)
-        model.eval()
-        test_acc, test_preds = step(test_loader, model, optim, train=False)
-        all_folds_acc += test_acc
-        LOG.debug(f'Testing Accuracy : {test_acc: {5}.{4}}')
-        # Save the best model
-        os.makedirs(os.path.join(DATASET_NAME.lower(), 'models'), exist_ok=True)
-        test_filename = f'fold{fold_num+1}_test_acc{test_acc:{5}.{4}}'
-        with open(f'{DATASET_NAME.lower()}/models/{test_filename}.pth', 'wb') as fp:
-            torch.save(best_state, fp)
-        # Save the predictions
-        os.makedirs(os.path.join(DATASET_NAME.lower(), 'predictions'), exist_ok=True)
-        # test_preds is an array containing the predictions for the test data for the current fold
-        pickle.dump([test_preds], open(f'{DATASET_NAME.lower()}/predictions/{test_filename}.p', "wb"))
-        # delete model to free GPU memory
-        del model
-        del optim
-    LOG.debug('Overall test accuracy over %d folds: %5.4f', NUM_FOLDS, all_folds_acc/NUM_FOLDS)
+        fold_metrics = run_fold(fold_num)
+        for metric_type in all_folds_metrics:
+            all_folds_metrics[metric_type] += fold_metrics[metric_type]
+    for metric_type in all_folds_metrics:
+        LOG.debug('Overall test {metric_type} over %d folds: %5.4f', NUM_FOLDS, all_folds_metrics[metric_type] / NUM_FOLDS)
 
 if __name__ == "__main__":
     # Initialise data

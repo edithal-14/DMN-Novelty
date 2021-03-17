@@ -1,5 +1,5 @@
 """
-Serialize DLND documents to include infersent sentence embeddings
+Serialize DLND2 documents to include infersent sentence embeddings
 such that we can represent documents as matrices.
 Dumps relevant data into a pickle file, which will be loaded for
 creating a model.
@@ -17,19 +17,19 @@ sys.path.append(ROOT_DIR)
 import torch
 torch.cuda.set_device(2)
 import xml.etree.ElementTree as ET
-from logging import init_logger
+from logger import init_logger
 from itertools import chain
 
 LOG = logging.getLogger()
-init_logger(LOG, os.path.join(ROOT_DIR, 'dlnd/dlnd_logs'))
+init_logger(LOG, os.path.join(ROOT_DIR, 'dlnd2/dlnd2_logs'))
 
 # Config variables
 HOME_DIR = "/home1/tirthankar"
-DLND_PATH = os.path.join(HOME_DIR, "Vignesh/TAP-DLND-1.0_LREC2018_modified")
+DLND2_PATH = os.path.join(HOME_DIR, "Vignesh/DLND2/TAPNew")
 GLOVE_PATH = os.path.join(HOME_DIR, "glove.840B.300d.txt")
 ENCODER_DIR = os.path.join(HOME_DIR, "Vignesh/InferSent")
 ENCODER_PATH = os.path.join(ENCODER_DIR, "models/model_2048_attn.pickle")
-SAVE_FILE_PATH = "dlnd_data.p"
+SAVE_FILE_PATH = "dlnd2_data.p"
 
 # Infersent should be in the path to load the encoder
 sys.path.append(ENCODER_DIR)
@@ -40,11 +40,13 @@ def list_docs():
     """
     source_docs = list()
     tgt_docs = list()
-    for genre in os.listdir(DLND_PATH):
-        genre_dir = os.path.join(DLND_PATH, genre)
-        if os.path.isdir(genre_dir):
+    for genre in os.listdir(DLND2_PATH):
+        genre_dir = os.path.join(DLND2_PATH, genre)
+        if os.path.isdir(genre_dir) and not genre_dir.startswith('.'):
             for topic in os.listdir(genre_dir):
                 topic_dir = os.path.join(genre_dir, topic)
+                if not os.path.isdir(topic_dir):
+                    continue
                 tgt_dir = os.path.join(topic_dir, 'target')
                 source_dir = os.path.join(topic_dir, 'source')
                 for doc in os.listdir(tgt_dir):
@@ -78,11 +80,8 @@ def get_golds(new_docs):
     new_golds = list()
     for doc in new_docs:
         for tag in ET.parse(doc[0][:-4] + '.xml').findall('feature'):
-            if 'DLA' in tag.attrib:
-                if tag.attrib['DLA'] == 'Novel':
-                    new_golds.append(1)
-                else:
-                    new_golds.append(0)
+            if 'SLNS' in tag.attrib:
+                new_golds.append(float(tag.attrib['SLNS']))
     return new_golds
 
 def get_sent_embs(tgt_docs, src_docs):

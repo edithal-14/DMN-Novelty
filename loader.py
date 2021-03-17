@@ -6,7 +6,7 @@ import logging
 import pickle
 import random
 import numpy as np
-from sklearn.model_selection import train_test_split, StratifiedKFold
+from sklearn.model_selection import train_test_split, StratifiedKFold, KFold
 from torch.utils.data.dataset import Dataset
 from torch.utils.data.dataloader import default_collate
 
@@ -15,6 +15,8 @@ LOG = logging.getLogger()
 DLND_DATA = 'dlnd/dlnd_data.p'
 APWSJ_DATA = 'apwsj/apwsj_data.p'
 STE_DATA = 'ste/ste_data.p'
+WEBIS_DATA = 'webis/webis_data.p'
+DLND2_DATA = 'dlnd2/dlnd2_data.p'
 RANDOM_SEED = 1234
 
 def oversample(data, minority_class):
@@ -34,11 +36,14 @@ def oversample(data, minority_class):
         data[item_no] += [data[item_no][idx] for idx in random_ids]
     return data
 
-def split_stratify_data(data, train_ratio):
+def split_stratify_data(data, train_ratio, stratify=True):
     """
     Split data into train and test data
     """
-    answers = data[-1]
+    if stratify:
+        answers = data[-1]
+    else:
+        answers = None
     splitting = train_test_split(*data,
                                  train_size=train_ratio,
                                  random_state=RANDOM_SEED,
@@ -62,6 +67,29 @@ def get_dlnd_data():
     data = [src_docs, tgt_docs, src_ids, tgt_ids, golds]
     return oversample(data, 1), vocab, ['']
 
+def get_dlnd2_data():
+    """
+    Read the dlnd data from the pickle file and pre-process it.
+    """
+    # Add encoding='latin1' to unpickle a file in python3 which was picklized in python2
+    # data = [src_docs, tgt_docs, src_ids, tgt_ids, vocab, golds]
+    src_docs, tgt_docs, src_ids, tgt_ids, vocab, golds \
+            = pickle.load(open(DLND_DATA, 'rb'), encoding='latin1')
+    golds = np.array([round(i / 100, 2) for i in golds], dtype=np.float32)
+    data = [src_docs, tgt_docs, src_ids, tgt_ids, golds]
+    return data, vocab, ['']
+
+def get_webis_data():
+    """
+    Read the webis data from the pickle file and pre-process it.
+    """
+    # Add encoding='latin1' to unpickle a file in python3 which was picklized in python2
+    # data = [doc_ids, src_ids, tgt_ids, vocab, golds]
+    doc_ids, src_ids, tgt_ids, vocab, golds \
+            = pickle.load(open(WEBIS_DATA, 'rb'), encoding='latin1')
+    # random oversampling of minority class (novel class: 1)
+    data = [doc_ids, src_ids, tgt_ids, golds]
+    return oversample(data, 1), vocab, ['']
 
 def get_apwsj_data():
     """
@@ -127,12 +155,12 @@ def get_ste_data():
     # random oversample of minority class (non-novel class: 0)
     return oversample(data, 0), vocab, topics
 
-def split_data(data, train_ratio):
+def split_data(data, train_ratio, stratify=True):
     """
     Split data into training, validation and testing data
     """
-    train_data, test_data = split_stratify_data(data, train_ratio)
-    train_data, valid_data = split_stratify_data(train_data, train_ratio)
+    train_data, test_data = split_stratify_data(data, train_ratio, stratify)
+    train_data, valid_data = split_stratify_data(train_data, train_ratio, stratify)
     return train_data, valid_data, test_data
 
 def pad_collate(batch, vocab):
@@ -212,6 +240,10 @@ class DmnData(Dataset):
             self.all_data = list()
             for data_item in self.data:
                 self.all_data.append(data_item[:])
+        elif dataset_name == 'WEBIS':
+            self.data, self.vocab, self.topics = get_webis_data()
+        elif dataset_name == 'DLND2':
+            self.data, self.vocab, self.topics = get_dlnd2_data()
         else:
             raise Exception('Dataset name %s is not supported!' % dataset_name)
         # Set self.hidden = embedding size = self.vocab.shape[1]
@@ -239,20 +271,32 @@ class DmnData(Dataset):
         """
         Initialize self.{train,valid,test} by splitting self.data
         """
+        if self.dataset_name == 'DLND2':
+            stratify = False
+        else:
+            stratify = True
         if self.num_folds <= 1:
             if self.dataset_name == 'STE':
                 train_ratio = 0.8
             else:
                 train_ratio = 0.9
-            self.train, self.valid, self.test = split_data(self.data, train_ratio)
+            self.train, self.valid, self.test = split_data(self.data, train_ratio, stratify)
             LOG.debug('Train ratio: %f', train_ratio)
         else:
-            # golds = data[-1]
-            skf = StratifiedKFold(
-                n_splits=self.num_folds,
-                random_state=RANDOM_SEED,
-                shuffle=True)
-            self.folds = skf.split(np.zeros(len(self.data[0])), self.data[-1])
+            if stratify:
+                fold_gen = StratifiedKFold(
+                    n_splits=self.num_folds,
+                    random_state=RANDOM_SEED,
+                    shuffle=True
+                )
+                self.folds = fold_gen.split(np.zeros(len(self.data[0])), self.data[-1])
+            else:
+                fold_gen = KFold(
+                    n_splits=self.num_folds,
+                    random_state=RANDOM_SEED,
+                    shuffle=True
+                )
+                self.folds = fold_gen.split(np.zeros(len(self.data[0])))
             self.next_fold()
             LOG.debug('Will do %d fold cross validation', self.num_folds)
         # Log data set size details
