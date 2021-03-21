@@ -17,7 +17,7 @@ BATCH_SIZE = 16
 EARLY_STOP_THRESHOLD = 4
 PRE_TRAINED_MODEL = None
 EPOCH_OFFSET = 1
-GPU_ID = 0
+GPU_ID = 6
 DATASET_NAME = sys.argv[1]
 IS_REGRESSION = False
 if DATASET_NAME == 'DLND':
@@ -33,8 +33,8 @@ elif DATASET_NAME == 'WEBIS':
     LOGFILE = 'webis/webis_logs'
     IS_SENTENCE_LEVEL = True
 elif DATASET_NAME == 'DLND2':
-    LOGFILE = 'dlnd2/dlnd2_logs'
-    IS_SENTENCE_LEVEL = False
+    LOGFILE = 'dlnd2/dlnd2_sent_logs'
+    IS_SENTENCE_LEVEL = True
     IS_REGRESSION = True
 else:
     raise Exception('Dataset name %s is not supported!' % DATASET_NAME)
@@ -467,10 +467,10 @@ def step(dataloader, model, optim, train=True):
             metrics[metric_type] += step_metrics[metric_type] * batch_size
         if train:
             loss.backward()
+            optim.step()
             if batch_idx % 80 == 0:
                 perf_str = ', '.join([f'{metric_type}: {metrics[metric_type] / cnt: {5}.{4}}' for metric_type in metrics])
                 LOG.debug(f'Training loss : {total_loss / cnt: {5}.{4}}, {perf_str}, batch_idx: {batch_idx}')
-            optim.step()
     for metric_type in metrics:
         total_loss /= cnt
         metrics[metric_type] /= cnt
@@ -490,20 +490,19 @@ def pretty_size(size):
 
 def dump_tensors(gpu_only=True):
     """Prints a list of the Tensors being tracked by the garbage collector."""
-    import gc
     total_size = 0
     for obj in gc.get_objects():
         try:
             if torch.is_tensor(obj):
                 if not gpu_only or obj.is_cuda:
-                    print("%s:%s%s %s" % (type(obj).__name__,
+                    LOG.debug("%s:%s%s %s" % (type(obj).__name__,
                                           " GPU" if obj.is_cuda else "",
                                           " pinned" if obj.is_pinned else "",
                                           pretty_size(obj.size())))
                     total_size += obj.numel()
             elif hasattr(obj, "data") and torch.is_tensor(obj.data):
                 if not gpu_only or obj.is_cuda:
-                    print("%s -> %s:%s%s%s%s %s" % (type(obj).__name__,
+                    LOG.debug("%s -> %s:%s%s%s%s %s" % (type(obj).__name__,
                                                     type(obj.data).__name__,
                                                     " GPU" if obj.is_cuda else "",
                                                     " pinned" if obj.data.is_pinned else "",
@@ -513,12 +512,12 @@ def dump_tensors(gpu_only=True):
                     total_size += obj.data.numel()
         except:
             pass
-        print("Total size:", total_size)
+    LOG.debug("Total size: %d", total_size)
 
 
 def print_memory_stats():
-    print('GPU memory usage: %f' % torch.cuda.memory_allocated())
-    print('Caching allocator memory usage: %f' % torch.cuda.memory_cached())
+    LOG.debug('GPU memory usage: %f' % torch.cuda.memory_allocated())
+    LOG.debug('Caching allocator memory usage: %f' % torch.cuda.memory_cached())
 
 
 def run_fold(fold_num):
@@ -610,11 +609,13 @@ def perform_folds(dset, collate_func):
         all_folds_metrics = {'acc': 0.0}
     # Training and validation starts here
     for fold_num in range(NUM_FOLDS):
+        print_memory_stats()
+        dump_tensors()
         fold_metrics = run_fold(fold_num)
         for metric_type in all_folds_metrics:
             all_folds_metrics[metric_type] += fold_metrics[metric_type]
     for metric_type in all_folds_metrics:
-        LOG.debug('Overall test {metric_type} over %d folds: %5.4f', NUM_FOLDS, all_folds_metrics[metric_type] / NUM_FOLDS)
+        LOG.debug('Overall test %s over %d folds: %5.4f', metric_type, NUM_FOLDS, all_folds_metrics[metric_type] / NUM_FOLDS)
 
 if __name__ == "__main__":
     # Initialise data
