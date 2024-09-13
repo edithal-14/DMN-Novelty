@@ -1,6 +1,10 @@
 # Description
 Exploring Dynamic memory networks for novelty detection
 
+# Link to paper
+* https://aclanthology.org/2022.paclic-1.58.pdf
+* This paper was accepted in 36th Pacific Asia Conference on Language, Information and Computation (PACLIC 36) which took place from October 20-22, 2022, in a fully virtual format in the Philippines
+
 # References
 * This code is based on the original DMN+ paper: https://arxiv.org/abs/1603.01417
 * This code is a modified version of the DMN+ implementation by dandelin: https://github.com/dandelin/Dynamic-memory-networks-plus-Pytorch
